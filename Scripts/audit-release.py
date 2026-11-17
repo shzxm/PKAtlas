@@ -21,6 +21,11 @@ SENSITIVE = [
   re.compile(rb'(?i)gh[pousr]_[A-Za-z0-9]{28,}'),
 ]
 IPV4 = re.compile(rb'(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)')
+# A *generic* network allowlist avoids committing any personal hostname to
+# the public scanner. This applies to executable app Swift, not medication
+# literature citations stored as data in the bundled catalog.
+URL_HOST = re.compile(rb'https?://([A-Za-z0-9][A-Za-z0-9.-]{1,245})', re.I)
+ALLOWED_RUNTIME_HOSTS = {'github.com', 'api.github.com', 'your-server.example'}
 
 
 def audit(path: Path) -> list[str]:
@@ -28,6 +33,12 @@ def audit(path: Path) -> list[str]:
     reasons=[]
     for rule in SENSITIVE:
         if rule.search(raw): reasons.append('person-specific path or private signing material')
+    if path.suffix == '.swift' and ('Native' in path.parts or 'Sources' in path.parts):
+        for match in URL_HOST.finditer(raw):
+            host = match.group(1).decode('ascii', 'ignore').lower().rstrip('.')
+            if host not in ALLOWED_RUNTIME_HOSTS:
+                reasons.append('runtime URL host not allowlisted for public iOS build')
+                break
     for match in IPV4.finditer(raw):
         try:
             addr=ipaddress.ip_address(match.group().decode())
