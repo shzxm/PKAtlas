@@ -4,6 +4,13 @@ struct PKServerResponse: Decodable {
     var version: Int
     var state: PKCloudState
 }
+struct PKLastUploadRequest: Encodable {
+    let version: Int
+    let state: PKCloudState
+    let syncPolicy = "last-upload-wins-v1"
+    let operationId: String
+}
+
 struct PKAuthResponse: Decodable {
     var username: String
     var account: PKServerResponse?
@@ -142,14 +149,8 @@ final class PKCloudAPI {
             let version: Int
             let syncPolicy: String?
         }
-        struct Body: Encodable {
-            let version: Int
-            let state: PKCloudState
-            let syncPolicy: String
-            let operationId: String
-        }
-        let data = try JSONEncoder().encode(Body(version: version, state: state,
-            syncPolicy: "last-upload-wins-v1", operationId: operationId))
+        let data = try JSONEncoder().encode(PKLastUploadRequest(
+            version: version, state: state, operationId: operationId))
         let receipt: Ack = try await request("/api/state", method: "PUT", body: data)
         guard receipt.syncPolicy == "last-upload-wins-v1" else {
             throw PKHTTPError(status: 426, message: "服务器不支持最后上传优先同步，请先升级后端")
