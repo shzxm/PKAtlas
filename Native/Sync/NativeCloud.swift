@@ -133,6 +133,30 @@ final class PKCloudAPI {
         let body = try JSONEncoder().encode(Body(version: version, sections: sections))
         let _: Result = try await request("/api/state/sections", method: "PUT", body: body)
     }
+    /// The server serializes successful full-snapshot commits. A request ID is
+    /// reused after a lost response to avoid replaying an older snapshot over
+    /// a later device upload. No wall-clock timestamp or device ID is sent.
+    func putLastUploadSnapshot(version: Int, state: PKCloudState,
+                               operationId: String) async throws -> Int {
+        struct Ack: Decodable {
+            let version: Int
+            let syncPolicy: String?
+        }
+        struct Body: Encodable {
+            let version: Int
+            let state: PKCloudState
+            let syncPolicy: String
+            let operationId: String
+        }
+        let data = try JSONEncoder().encode(Body(version: version, state: state,
+            syncPolicy: "last-upload-wins-v1", operationId: operationId))
+        let receipt: Ack = try await request("/api/state", method: "PUT", body: data)
+        guard receipt.syncPolicy == "last-upload-wins-v1" else {
+            throw PKHTTPError(status: 426, message: "服务器不支持最后上传优先同步，请先升级后端")
+        }
+        return receipt.version
+    }
+
 
     func me() async throws -> PKMeResponse { try await request("/api/me") }
 
