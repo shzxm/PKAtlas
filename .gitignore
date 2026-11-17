@@ -1,0 +1,19 @@
+.build/
+dist/
+.DS_Store
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.ipa
+*.mobileprovision
+*.p12
+*.p8
+.env
+.env.*
+*.pem
+*.key
+# Personal scripts, exported patient data and local private environment
+private/
+local/
+*_private*
