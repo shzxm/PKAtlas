@@ -1,0 +1,16 @@
+name: iOS source syntax
+on:
+  push:
+  pull_request:
+jobs:
+  swift-syntax:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse all Swift app and test sources
+        shell: bash
+        run: |
+          find Native NativeTests Sources UITests -type f -name '*.swift' -print0 |
+          while IFS= read -r -d '' file; do
+            xcrun swiftc -frontend -parse "$file"
+          done

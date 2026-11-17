@@ -40,6 +40,21 @@ final class NativeAppStore: ObservableObject {
     private var loaded = false
     private var syncTask: Task<Void, Never>?
     private var syncRunning = false
+    // Persist the upload ID so retrying after process death cannot replay an
+    // old payload over another device's more recent successful commit.
+    private var pendingUploadId: String? = UserDefaults.standard.string(forKey: "PKAtlasPendingUploadID")
+    private func uploadID() -> String {
+        if let pendingUploadId { return pendingUploadId }
+        let id = UUID().uuidString
+        pendingUploadId = id
+        UserDefaults.standard.set(id, forKey: "PKAtlasPendingUploadID")
+        return id
+    }
+    private func clearUploadID(ifMatches id: String) {
+        guard pendingUploadId == id else { return }
+        pendingUploadId = nil
+        UserDefaults.standard.removeObject(forKey: "PKAtlasPendingUploadID")
+    }
     private var lastModelCheck: Date?
     private var lastReleaseCheck: Date?
     private var lastReleasePrompted: String?
@@ -374,6 +389,10 @@ final class NativeAppStore: ObservableObject {
 
     private func changed() {
         hasPendingChanges = snapshot != base
+        if username != nil {
+            pendingUploadId = UUID().uuidString
+            UserDefaults.standard.set(pendingUploadId, forKey: "PKAtlasPendingUploadID")
+        }
         saveLocal()
         guard !showingError else { return }
         if username != nil {
@@ -465,40 +484,10 @@ final class NativeAppStore: ObservableObject {
     private func adopt(_ remote: PKServerResponse, as user: String) throws {
         let old = try? PKSecureDisk.load(username: user)
         username = user
+        // Never merge two snapshots; a pending local draft is one candidate
+        // complete upload, which becomes authoritative only when committed.
         if let old, old.state != old.base {
-            guard let doses = PKMerge.rows(base: old.base.records,
-                                           local: old.state.records,
-                                           remote: remote.state.records),
-                  let meals = PKMerge.rows(base: old.base.intakes,
-                                           local: old.state.intakes,
-                                           remote: remote.state.intakes) else {
-                snapshot = old.state
-                base = old.base
-                version = old.version
-                conflict = true
-                syncStatus = "设备修改冲突 · 未覆盖任何记录"
-                saveLocal()
-                return
-            }
-            var merged = remote.state
-            merged.records = doses
-            merged.intakes = meals
-            guard let settings = PKMerge.fields(base: old.base.settings,
-                    local: old.state.settings, remote: remote.state.settings),
-                  let plans = PKMerge.fields(base: old.base.plans,
-                    local: old.state.plans, remote: remote.state.plans),
-                  let courses = PKMerge.rows(base: old.base.courses,
-                    local: old.state.courses, remote: remote.state.courses) else {
-                snapshot = old.state; base = old.base; version = old.version
-                conflict = true
-                syncStatus = "账号配置与云端修改冲突 · 已保留本机快照"
-                saveLocal()
-                return
-            }
-            merged.settings = settings
-            merged.plans = plans
-            merged.courses = courses
-            snapshot = merged
+            snapshot = old.state
             selectedDrugID = old.selectedDrug
         } else {
             snapshot = remote.state
@@ -509,7 +498,9 @@ final class NativeAppStore: ObservableObject {
         conflict = false
         hasPendingChanges = snapshot != base
         saveLocal()
-        syncStatus = hasPendingChanges ? "本机草稿已恢复，等待同步" : "云端已同步"
+        syncStatus = hasPendingChanges
+            ? "已恢复本机完整草稿，上传成功后将作为最新版本"
+            : "云端最后上传版本已同步"
         if hasPendingChanges { Task { await sync() } }
     }
 
@@ -536,112 +527,44 @@ final class NativeAppStore: ObservableObject {
         guard username != nil, !syncRunning, !conflict, hasPendingChanges else { return }
         syncRunning = true
         defer { syncRunning = false }
-        syncStatus = "正在确认云端保存…"
-
-        for _ in 0..<3 {
-            let sent = snapshot
-            let previous = base
-            var sections: [String: PKJSON] = [:]
-            if sent.records != previous.records {
-                sections["records"] = .array(sent.records.map { .object($0) })
+        let sent = snapshot
+        let op = uploadID()
+        syncStatus = "正在上传完整数据，以最后成功提交设备为准…"
+        do {
+            // Full snapshot and stable operationId. The backend serializes
+            // successful writes and ignores retries of the same upload ID.
+            _ = try await PKCloudAPI.shared.putLastUploadSnapshot(
+                version: version, state: sent, operationId: op)
+            let remote = try await PKCloudAPI.shared.state()
+            base = remote.state
+            version = remote.version
+            if snapshot == sent {
+                // Another device may have uploaded after us but before GET.
+                // Its newer snapshot wins; do not retry our older one.
+                snapshot = remote.state
+                clearUploadID(ifMatches: op)
             }
-            if sent.intakes != previous.intakes {
-                sections["intakes"] = .array(sent.intakes.map { .object($0) })
-            }
-            if sent.settings != previous.settings {
-                sections["settings"] = .object(sent.settings)
-            }
-            if sent.plans != previous.plans {
-                sections["plans"] = .object(sent.plans)
-            }
-            if sent.courses != previous.courses {
-                sections["courses"] = .array(sent.courses.map { .object($0) })
-            }
-            if sections.isEmpty {
-                hasPendingChanges = false
-                syncStatus = "云端已同步"
-                return
-            }
-            do {
-                try await PKCloudAPI.shared.putSections(version: version, sections: sections)
-                let remote = try await PKCloudAPI.shared.state()
-                // Preserve edits made while network was in flight. We do not
-                // declare success until a real server read-back matches.
-                guard remote.state.records == sent.records ||
-                      sections["records"] == nil else {
-                    conflict = true; syncStatus = "云端回读不一致，保留本机记录"; saveLocal()
-                    return
+            hasPendingChanges = snapshot != base
+            conflict = false
+            saveLocal()
+            syncStatus = hasPendingChanges
+                ? "上传期间有新的本机修改，继续提交新快照"
+                : "已回读确认服务器最后成功上传版本"
+            if hasPendingChanges {
+                Task {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    await self.sync()
                 }
-                guard remote.state.intakes == sent.intakes ||
-                      sections["intakes"] == nil else {
-                    conflict = true; syncStatus = "云端饮食回读不一致"; saveLocal()
-                    return
-                }
-                guard (sections["settings"] == nil || remote.state.settings == sent.settings),
-                      (sections["plans"] == nil || remote.state.plans == sent.plans),
-                      (sections["courses"] == nil || remote.state.courses == sent.courses) else {
-                    conflict = true
-                    syncStatus = "云端配置回读不一致，保留本机修改"
-                    saveLocal()
-                    return
-                }
-                base = remote.state
-                version = remote.version
-                if snapshot == sent {
-                    snapshot = remote.state
-                }
-                hasPendingChanges = snapshot != base
-                saveLocal()
-                syncStatus = hasPendingChanges ? "已保留较新的本机更改" : "云端已回读确认"
-                if hasPendingChanges {
-                    Task { try? await Task.sleep(for: .milliseconds(500)); await self.sync() }
-                }
-                await NativeReminderScheduler.shared.refresh()
-                return
-            } catch let error as PKHTTPError where error.status == 409 {
-                do {
-                    let remote = try await PKCloudAPI.shared.state()
-                    guard let mergedRecords = PKMerge.rows(
-                        base: base.records, local: snapshot.records, remote: remote.state.records),
-                          let mergedIntakes = PKMerge.rows(
-                            base: base.intakes, local: snapshot.intakes, remote: remote.state.intakes) else {
-                        conflict = true
-                        syncStatus = "同一条记录在其他设备修改 · 暂停同步"
-                        saveLocal()
-                        return
-                    }
-                    guard let mergedSettings = PKMerge.fields(
-                            base: base.settings, local: snapshot.settings,
-                            remote: remote.state.settings),
-                          let mergedPlans = PKMerge.fields(
-                            base: base.plans, local: snapshot.plans,
-                            remote: remote.state.plans),
-                          let mergedCourses = PKMerge.rows(base: base.courses,
-                            local: snapshot.courses, remote: remote.state.courses) else {
-                        conflict = true
-                        syncStatus = "云端与本机配置存在冲突 · 暂停覆盖"
-                        saveLocal()
-                        return
-                    }
-                    snapshot.records = mergedRecords
-                    snapshot.intakes = mergedIntakes
-                    snapshot.settings = mergedSettings
-                    snapshot.plans = mergedPlans
-                    snapshot.courses = mergedCourses
-                    base = remote.state
-                    version = remote.version
-                    hasPendingChanges = snapshot != base
-                    saveLocal()
-                } catch {
-                    syncStatus = "网络暂不可用，本机记录已保留"
-                    return
-                }
-            } catch {
-                syncStatus = "网络暂不可用，本机记录已保留"
-                return
             }
+            await NativeReminderScheduler.shared.refresh()
+        } catch let error as PKHTTPError where error.status == 409 || error.status == 426 {
+            conflict = true
+            syncStatus = "服务器仍使用旧式版本冲突规则；停止覆盖并保留本机草稿，请先升级后端"
+            saveLocal()
+        } catch {
+            syncStatus = "网络暂不可用或确认失败；保留本机草稿及相同上传编号，避免重复覆盖"
+            saveLocal()
         }
-        syncStatus = "云端版本变动较快，保留本机更改"
     }
 
     func resolveConflictByUsingCloud() async {
@@ -653,6 +576,7 @@ final class NativeAppStore: ObservableObject {
             version = latest.version
             conflict = false; hasPendingChanges = false
             syncStatus = "已选择云端版本"
+            if let pendingUploadId { clearUploadID(ifMatches: pendingUploadId) }
             saveLocal()
         } catch {
             syncStatus = "无法读取云端版本，请稍后重试"
