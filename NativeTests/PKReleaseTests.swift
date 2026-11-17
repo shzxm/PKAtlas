@@ -21,6 +21,20 @@ final class PKReleaseTests: XCTestCase {
         return (original, envelope, signer.publicKey.rawRepresentation)
     }
 
+    func testActualPublicGithubReleaseSignatureAndAssetHash() throws {
+        let url = try XCTUnwrap(Bundle(for: type(of: self)).url(
+            forResource: "PKGitHubReleaseFixture", withExtension: "json"))
+        let release = try JSONDecoder().decode(PKGitHubReleaseSnapshot.self,
+            from: Data(contentsOf: url))
+        let checked = try PKGitHubReleaseParser.validatedRelease(release)
+        XCTAssertEqual(checked.version, "2.7")
+        XCTAssertEqual(checked.build, 11)
+        XCTAssertEqual(checked.fileName,
+                       "PKAtlas-iOS27.2-v2.7-build11-unsigned.ipa")
+        XCTAssertEqual(checked.ipaSHA256,
+                       "d595203bd582bbf7672563fd362ef82032438cd04388dd103159d6f29f760504")
+    }
+
     func testSignedGithubBodyAssetAndVersion() throws {
         let fixture = try signedFixture()
         let signed = try JSONEncoder().encode(fixture.envelope).base64EncodedString()

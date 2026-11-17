@@ -57,7 +57,7 @@ final class PKAtlasUITests: XCTestCase {
         for _ in 0..<6 where !update.isHittable { app.swipeUp() }
         XCTAssertTrue(update.isHittable)
         update.tap()
-        let checked = NSPredicate(format: "label CONTAINS %@", "签名验证通过")
+        let checked = NSPredicate(format: "label CONTAINS %@", "独立发布密钥验证通过")
         expectation(for: checked, evaluatedWith: status)
         waitForExpectations(timeout: 25)
         XCTAssertFalse(app.webViews.firstMatch.exists)
