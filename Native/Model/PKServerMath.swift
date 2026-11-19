@@ -41,6 +41,34 @@ enum PKServerMath {
         case invalidResult
     }
 
+    /// Split only the wire request, never the data or the mathematical model.
+    /// Each contribution is linear in recorded doses, so sums of separately
+    /// evaluated batches are mathematically equivalent to one evaluation.
+    /// The 181 endpoint retains its strict 300-record / 60,000-work limits.
+    static func boundedRequests(drugId: String, times: [Int64], records: [Entry],
+                                planned: [Entry], meals: [Intake],
+                                renalCrCl: Double?) -> [Request] {
+        guard !times.isEmpty, !times.contains(where: { $0 <= 0 }) else { return [] }
+        let perBatch = max(1, min(90, 60_000 / times.count))
+        var requests = [Request]()
+        if records.isEmpty {
+            requests.append(Request(drugId: drugId, times: times, records: [],
+                                    planned: [], meals: meals, renalCrCl: renalCrCl))
+        } else {
+            for start in stride(from: 0, to: records.count, by: perBatch) {
+                let end = min(records.count, start + perBatch)
+                requests.append(Request(drugId: drugId, times: times,
+                    records: Array(records[start..<end]), planned: [],
+                    meals: meals, renalCrCl: renalCrCl))
+            }
+        }
+        if !planned.isEmpty {
+            requests.append(Request(drugId: drugId, times: times,
+                records: [], planned: planned, meals: meals, renalCrCl: renalCrCl))
+        }
+        return requests
+    }
+
     static func fetch(model: PKModel, drug: PKDrug, actual: [PKSample],
                       planned: [PKDose], expectedCatalogPrefix: String,
                       expectedEnginePrefix: String)
@@ -57,7 +85,7 @@ enum PKServerMath {
         let meals = model.intakes.filter { $0.kind == "meal" &&
             $0.time.timeIntervalSince1970 * 1000 >= first - 3 * 86_400_000 &&
             $0.time.timeIntervalSince1970 * 1000 <= last + 86_400_000 }
-        guard actualRows.count <= 300, planned.count <= 30, meals.count <= 160,
+        guard actualRows.count <= 2_000, planned.count <= 30, meals.count <= 160,
               actualRows.allSatisfy({
                 let t = $0.time.timeIntervalSince1970 * 1000
                 return t >= first - 180 * 86_400_000 && t <= last
@@ -70,48 +98,80 @@ enum PKServerMath {
             Entry(drug: drug.id, time: Int64(($0.time.timeIntervalSince1970 * 1000).rounded()),
                   mg: $0.mg)
         }
-        let payload = Request(
-            drugId: drug.id,
-            times: actual.map { Int64(($0.time.timeIntervalSince1970 * 1000).rounded()) },
-            records: actualRows.map(toEntry),
-            planned: planned.map(toEntry),
+        let sampleTimes = actual.map { Int64(($0.time.timeIntervalSince1970 * 1000).rounded()) }
+        let requests = boundedRequests(drugId: drug.id, times: sampleTimes,
+            records: actualRows.map(toEntry), planned: planned.map(toEntry),
             meals: meals.map { Intake(kind: "meal",
                 time: Int64(($0.time.timeIntervalSince1970 * 1000).rounded()),
                 mealType: $0.mealType == "highFat" ? "highFat" : "regular") },
             renalCrCl: model.renalCrCl)
-        let data = try JSONEncoder().encode(payload)
-        let result: Response = try await PKCloudAPI.shared.request(
-            "/api/native/math/samples", method: "POST", body: data)
-        guard result.source == "181-server-math",
-              result.engineVersion.hasPrefix(expectedEnginePrefix == "内置"
-                ? (PKModelDistribution.expectedEngineVersion ?? "__missing__")
-                : expectedEnginePrefix),
-              result.catalogVersion.hasPrefix(expectedCatalogPrefix),
-              result.serverKernelSha256.count == 64,
-              result.points.count == actual.count else {
-            throw Invalid.incompatibleModel
+        guard !requests.isEmpty, requests.count <= 25 else {
+            throw Invalid.invalidResult
         }
-        var confirmed: [PKSample] = []
-        var projected: [PKSample] = []
-        for (index, point) in result.points.enumerated() {
-            let base = actual[index]
-            guard abs(Double(point.time) -
-                      base.time.timeIntervalSince1970 * 1000) <= 2,
-                  [point.bloodMgL, point.equivalentMg, point.unfedMgL]
-                    .allSatisfy({ $0.isFinite && $0 >= 0 }) else {
-                throw Invalid.invalidResult
+        // Reduce each server response by its linear contribution, then apply
+        // once. A partial network failure never replaces a good local curve.
+        var blood = [Double](repeating: 0, count: actual.count)
+        var equivalent = blood
+        var unfed = blood
+        var forecastBlood = blood
+        var forecastEquivalent = blood
+        var sawForecast = false
+        for request in requests {
+            try Task.checkCancellation()
+            let payload = try JSONEncoder().encode(request)
+            let result: Response = try await PKCloudAPI.shared.request(
+                "/api/native/math/samples", method: "POST", body: payload)
+            guard result.source == "181-server-math",
+                  result.engineVersion.hasPrefix(expectedEnginePrefix == "内置"
+                    ? (PKModelDistribution.expectedEngineVersion ?? "__missing__")
+                    : expectedEnginePrefix),
+                  result.catalogVersion.hasPrefix(expectedCatalogPrefix),
+                  result.serverKernelSha256.count == 64,
+                  result.points.count == actual.count else {
+                throw Invalid.incompatibleModel
             }
-            confirmed.append(PKSample(time: base.time, concentration: point.bloodMgL,
-                                      equivalent: point.equivalentMg, unfed: point.unfedMgL))
-            if !planned.isEmpty {
-                guard let blood = point.plannedBloodMgL,
-                      let equivalent = point.plannedEquivalentMg,
-                      blood.isFinite, equivalent.isFinite,
-                      blood >= 0, equivalent >= 0 else {
+            for (index, point) in result.points.enumerated() {
+                guard abs(Double(point.time) - Double(sampleTimes[index])) <= 2,
+                      [point.bloodMgL, point.equivalentMg, point.unfedMgL]
+                        .allSatisfy({ $0.isFinite && $0 >= 0 }) else {
                     throw Invalid.invalidResult
                 }
-                projected.append(PKSample(time: base.time, concentration: blood,
-                                          equivalent: equivalent, unfed: point.unfedMgL))
+                blood[index] += point.bloodMgL
+                equivalent[index] += point.equivalentMg
+                unfed[index] += point.unfedMgL
+                if !request.planned.isEmpty {
+                    guard let mixedBlood = point.plannedBloodMgL,
+                          let mixedEquivalent = point.plannedEquivalentMg,
+                          mixedBlood.isFinite, mixedEquivalent.isFinite,
+                          mixedBlood >= 0, mixedEquivalent >= 0 else {
+                        throw Invalid.invalidResult
+                    }
+                    // This request deliberately contains no historical doses;
+                    // its mixed result is the increment due to preview nodes.
+                    forecastBlood[index] += mixedBlood
+                    forecastEquivalent[index] += mixedEquivalent
+                    sawForecast = true
+                }
+            }
+        }
+        var confirmed = [PKSample]()
+        var projected = [PKSample]()
+        confirmed.reserveCapacity(actual.count)
+        if sawForecast { projected.reserveCapacity(actual.count) }
+        for index in actual.indices {
+            let values = [blood[index], equivalent[index], unfed[index],
+                          forecastBlood[index], forecastEquivalent[index]]
+            guard values.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1_000_000_000 }) else {
+                throw Invalid.invalidResult
+            }
+            confirmed.append(PKSample(time: actual[index].time,
+                concentration: blood[index], equivalent: equivalent[index],
+                unfed: unfed[index]))
+            if sawForecast {
+                projected.append(PKSample(time: actual[index].time,
+                    concentration: blood[index] + forecastBlood[index],
+                    equivalent: equivalent[index] + forecastEquivalent[index],
+                    unfed: unfed[index]))
             }
         }
         return (confirmed, projected)

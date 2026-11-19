@@ -98,6 +98,28 @@ final class NativeReminderScheduler: NSObject, ObservableObject, UNUserNotificat
         }
     }
 
+    /// Visible foreground notification when a verified cloud pull detects
+    /// another device's adopted-model change. APNs is responsible for closed
+    /// apps; never pretend a locally scheduled notification can wake an App
+    /// which has never launched or has no system authorization.
+    func announceRemoteAdoptedChange() async {
+        let settings = await center.notificationSettings()
+        guard settings.authorizationStatus == .authorized ||
+              settings.authorizationStatus == .provisional,
+              NativeAppStore.shared.isLoggedIn else { return }
+        // When working APNs is configured the server delivers the alert; don't
+        // generate a second local banner on the same sync event.
+        if PKRemotePushManager.shared.providerConfigured { return }
+        let content = UNMutableNotificationContent()
+        content.title = "药时 · 已采用数学方案已同步"
+        content.body = "其他设备更新了已采用的数学方案与待核对计划，请打开查看。不是服药建议。"
+        content.sound = .default
+        let request = UNNotificationRequest(identifier:
+            "pkatlas.native.cloud-adopted." + UUID().uuidString,
+            content: content, trigger: nil)
+        try? await center.add(request)
+    }
+
     func clear() async {
         let ids = await center.pendingNotificationRequests().map(\.identifier)
             .filter { $0.hasPrefix(identifierPrefix) }

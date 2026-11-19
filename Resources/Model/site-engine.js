@@ -1,5 +1,5 @@
 "use strict";
-const PK_MODEL_ENGINE_VERSION = "02a6fea6e809657f436befee79140efe71e6b745dcf9c7c80ae7347d82360cdf";
+const PK_MODEL_ENGINE_VERSION = "314ad1b1957b9c6d61250ef2cdc9538de61bd944ace8de660cf3fcb30abc3f03";
 
 // Published Cmax values describe a specific studied formulation/population.
 // The Bateman curve and dose proportionality below are teaching assumptions.
@@ -19,6 +19,19 @@ const isJournalReview=r=>isJournalArchive(r)&&["possibleDuplicate","duplicate"].
 const JOURNAL_NAMES={Pregabalin:"普瑞巴林",Lorazepam:"劳拉西泮"};
 const recordDrugName=r=>DRUGS.find(d=>d.id===r.drug)?.name||`${JOURNAL_NAMES[r.journal?.substanceName]||r.journal?.substanceName||r.drug}${isJournalReview(r)?r.journal.reviewStatus==="duplicate"?"（已标重复）":"（待核对）":""}`;
 const safeRecords=raw=>Array.isArray(raw)?raw.filter(r=>r&&(DRUGS.some(d=>d.id===r.drug)||isJournalArchive(r))&&Number.isFinite(r.time)&&Number.isFinite(r.mg)&&r.mg>0).slice(-10000).map(r=>({...r,id:String(r.id||uuid())})):[];
+// Account-synced what-if entries: never treated as a taken record.
+// Overdue plans stay plans until an explicit user confirmation.
+const safeScheduledDoses=raw=>Array.isArray(raw)?raw.filter(r=>r&&typeof r.id==="string"&&
+  DRUGS.some(d=>d.id===r.drug)&&Number.isFinite(r.time)&&Number.isFinite(r.mg)&&
+  r.mg>0&&r.mg<100000).slice(-50000).map(r=>({id:r.id,drug:r.drug,time:r.time,
+  mg:r.mg,unit:r.unit==="g"?"g":"mg",kind:"planned"})):[];
+const futurePreviewNodes=(drug,extras=[])=>{
+  const rows=[...scheduledDoses.filter(d=>d.drug===drug&&d.time>=Date.now()-120000&&
+    !records.some(row=>row.drug===drug&&(row.id===d.id||Math.abs(row.time-d.time)<=60000&&Math.abs(row.mg-d.mg)<.0001)))];
+  for(const node of extras)if(node&&Number.isFinite(node.time)&&Number.isFinite(node.mg)&&node.mg>0&&
+    !rows.some(old=>old.id===node.id||Math.abs(old.time-node.time)<=60000&&Math.abs(old.mg-node.mg)<.0001))rows.push(node);
+  return rows.sort((a,b)=>a.time-b.time);
+};
 const safeCourses=raw=>Array.isArray(raw)?raw.filter(c=>c&&typeof c.id==="string"&&DRUGS.some(d=>d.id===c.drug)&&Number.isFinite(c.start)&&Number.isFinite(c.days)&&c.days>=1&&c.days<=90).slice(-3000):[];
 const safeIntakes=raw=>Array.isArray(raw)?raw.filter(x=>x&&Number.isFinite(x.time)&&["meal","drink"].includes(x.kind)&&["none","water","coffee","tea","milk","juice","alcohol","other"].includes(x.drink||"none")).slice(-10000).map(x=>({id:String(x.id||uuid()),time:x.time,kind:x.kind,mealType:x.mealType==="highFat"?"highFat":"regular",drink:x.drink||"none",note:String(x.note||"").slice(0,100)})):[];
 const safeRenal=raw=>raw&&Number.isFinite(Number(raw.crcl))&&Number(raw.crcl)>=15&&Number(raw.crcl)<=150?{crcl:Number(raw.crcl),source:raw.source==="estimated"?"estimated":"entered"}:null;
@@ -49,12 +62,13 @@ const safeInverseMemory=raw=>{
   }
   return out;
 };
-let records=[],courses=[],plans={},intakes=[],renal=null,referenceMemory={},inverseMemory={};
+let records=[],courses=[],plans={},intakes=[],scheduledDoses=[],renal=null,referenceMemory={},inverseMemory={};
 const mealMatchCache=new Map();
 const MEAL_BEFORE_DOSE_MINUTES=90,MEAL_AFTER_DOSE_MINUTES=15;
 const mealBeforeDoseMinutes=drugId=>FOOD_INFO[drugId]?.mealWindowMinutes||MEAL_BEFORE_DOSE_MINUTES;
 try{records=safeRecords(JSON.parse(getStored(RECORD_KEY)||"null"))}catch{}
 try{courses=safeCourses(JSON.parse(getStored(COURSE_KEY)||"null"))}catch{}
+try{scheduledDoses=safeScheduledDoses(JSON.parse(getStored("pk-atlas-planned-doses-v1")||"null"))}catch{}
 try{const saved=JSON.parse(getStored(PLAN_KEY)||"null");if(saved&&typeof saved==="object"&&!Array.isArray(saved))plans=saved}catch{}
 try{intakes=safeIntakes(JSON.parse(getStored(INTAKE_KEY)||"null"))}catch{}
 try{renal=safeRenal(JSON.parse(getStored(RENAL_KEY)||"null"))}catch{}
@@ -81,7 +95,7 @@ function safeEditorDrafts(raw){
 }
 let editorDrafts={};
 
-const snapshot=()=>({records:structuredClone(records),courses:structuredClone(courses),plans:structuredClone(plans),intakes:structuredClone(intakes),settings:{currentDrug:current,renal:structuredClone(renal),referenceMemory:structuredClone(referenceMemory),inverseMemory:structuredClone(inverseMemory),editorDrafts:structuredClone(editorDrafts)}});
+const snapshot=()=>({records:structuredClone(records),courses:structuredClone(courses),plans:structuredClone(plans),intakes:structuredClone(intakes),settings:{...structuredClone(baseState?.settings||{}),currentDrug:current,renal:structuredClone(renal),referenceMemory:structuredClone(referenceMemory),inverseMemory:structuredClone(inverseMemory),editorDrafts:structuredClone(editorDrafts),scheduledDoses:structuredClone(scheduledDoses)}});
 function migrateLegacy(){
   const ungrouped=records.filter(r=>!courses.some(c=>c.id===r.courseId));
   if(!ungrouped.length)return;
@@ -151,8 +165,9 @@ function mergeState(base,local,remote){
   const mergedReferences=mergeObjects(base.settings?.referenceMemory||{},local.settings?.referenceMemory||{},remote.settings?.referenceMemory||{});
   const mergedInverse=mergeObjects(base.settings?.inverseMemory||{},local.settings?.inverseMemory||{},remote.settings?.inverseMemory||{});
   const mergedEditors=mergeEditorDrafts(base.settings?.editorDrafts||{},local.settings?.editorDrafts||{},remote.settings?.editorDrafts||{});
-  if(!mergedRecords||!mergedCourses||!mergedIntakes||!mergedPlans||!mergedRenal||!mergedReferences||!mergedInverse||!mergedEditors)return null;
-  return{records:mergedRecords,courses:mergedCourses,plans:mergedPlans,intakes:mergedIntakes,settings:{...remote.settings,...local.settings,renal:mergedRenal.renal,referenceMemory:mergedReferences,inverseMemory:mergedInverse,editorDrafts:mergedEditors}};
+  const mergedScheduled=mergeList(base.settings?.scheduledDoses||[],local.settings?.scheduledDoses||[],remote.settings?.scheduledDoses||[]);
+  if(!mergedRecords||!mergedCourses||!mergedIntakes||!mergedPlans||!mergedRenal||!mergedReferences||!mergedInverse||!mergedEditors||!mergedScheduled)return null;
+  return{records:mergedRecords,courses:mergedCourses,plans:mergedPlans,intakes:mergedIntakes,settings:{...remote.settings,...local.settings,renal:mergedRenal.renal,referenceMemory:mergedReferences,inverseMemory:mergedInverse,editorDrafts:mergedEditors,scheduledDoses:mergedScheduled}};
 }
 function mergeLocalForUpload(remote,local){
   const byId=(cloud,device)=>[...new Map([...(cloud||[]),...(device||[])].map(row=>[row.id,row])).values()];
@@ -163,15 +178,16 @@ function mergeLocalForUpload(remote,local){
     intakes:byId(remote.intakes,local.intakes),
     plans:{...(remote.plans||{}),...(local.plans||{})},
     settings:{...cloudSettings,...localSettings,
+      scheduledDoses:byId(cloudSettings.scheduledDoses,localSettings.scheduledDoses),
       referenceMemory:{...(cloudSettings.referenceMemory||{}),...(localSettings.referenceMemory||{})},
       inverseMemory:{...(cloudSettings.inverseMemory||{}),...(localSettings.inverseMemory||{})}}
   };
 }
 function incomingLocalTransfer(){try{return JSON.parse(sessionStorage.getItem(TRANSFER_KEY)||"null")}catch{return null}}
 function startLocalTransfer(){
-  const targetOrigin="https://example.invalid";
+  const targetOrigin="https://pk.example.com";
   const draft=(()=>{try{return JSON.parse(getStored(DRAFT_KEY)||"null")}catch{return null}})();
-  const guest=snapshot(),hasGuest=guest.records.length||guest.intakes.length||Object.keys(guest.plans).length||guest.settings.renal;
+  const guest=snapshot(),hasGuest=guest.records.length||guest.intakes.length||guest.settings.scheduledDoses.length||Object.keys(guest.plans).length||guest.settings.renal;
   const source=draft?.state?hasGuest?mergeLocalForUpload(draft.state,guest):draft.state:guest;
   const popup=window.open(`${targetOrigin}/?local-transfer=1`,"_blank");
   if(!popup){setSyncStatus("新页面被浏览器拦截，请允许打开新页面后重试；本机数据仍在。",true);return}
@@ -185,18 +201,31 @@ function startLocalTransfer(){
   window.addEventListener("message",onMessage);
   setTimeout(()=>window.removeEventListener("message",onMessage),5*60000);
 }
+// Avoid publishing historical private IPs/hostnames in publicly readable JS.
+// Require manual confirmation before any transferred data is written remotely.
+function permittedLegacyTransferOrigin(origin){
+  try{
+    const u=new URL(origin);
+    if(u.protocol!=="http:"||u.port||u.username||u.password)return false;
+    const host=u.hostname.toLowerCase(),parts=host.split(".");
+    const n=parts.map(Number);
+    const localIP=parts.length===4&&parts.every((p,i)=>/^\d{1,3}$/.test(p)&&Number(p)===n[i]&&n[i]>=0&&n[i]<=255)&&
+      (n[0]===10||(n[0]===172&&n[1]>=16&&n[1]<=31)||(n[0]===192&&n[1]===168));
+    const own=location.hostname.toLowerCase(),base=own.split(".").slice(-2).join(".");
+    const sibling=own.split(".").length===3&&parts.length===3&&host!==own&&host.endsWith("."+base);
+    return localIP||sibling;
+  }catch{return false}
+}
 function initLocalTransferReceiver(){
   if(!new URLSearchParams(location.search).has("local-transfer")||!window.opener)return;
-  const allowed=new Set(["http://localhost","http://example.invalid"]);
   window.addEventListener("message",event=>{
-    if(event.source!==window.opener||!allowed.has(event.origin)||event.data?.type!=="pk-atlas-transfer-data")return;
+    if(event.source!==window.opener||!permittedLegacyTransferOrigin(event.origin)||event.data?.type!=="pk-atlas-transfer-data")return;
     const state=event.data.state;
     if(!state||typeof state!=="object"||!Array.isArray(state.records)||state.records.length>10000||!Array.isArray(state.intakes||[])||JSON.stringify(state).length>2000000){setSyncStatus("本机数据格式或大小不符合云端要求。",true);return}
     try{sessionStorage.setItem(TRANSFER_KEY,JSON.stringify({state,origin:event.origin,sourceUsername:String(event.data.sourceUsername||"").slice(0,32)}))}
     catch{setSyncStatus("浏览器无法暂存本机数据，请检查存储空间后重试。",true);return}
     window.opener.postMessage({type:"pk-atlas-transfer-received"},event.origin);
-    if(authUser)setTimeout(()=>$("saveLocalCloud").click(),0);
-    else setSyncStatus("已接收本机数据，登录后可保存到云端。");
+    setSyncStatus("已接收历史记录。请人工检查后点击『保存本地数据至云端』；不会自动上传。",false);
   });
   window.opener.postMessage({type:"pk-atlas-transfer-ready"},"*");
 }
@@ -239,7 +268,8 @@ const SYNC_TAB_ID=(()=>{
   try{return crypto.randomUUID()}catch{return String(Date.now())+"-"+Math.random().toString(36).slice(2)}
 })();
 let syncRevision=0,syncTimer=0,syncRetryDelay=1000,syncRecoveredDrafts=[],syncLastEditAt=0;
-let syncStorageError=false,syncPulling=false;
+let syncStorageError=false,syncPulling=false,syncUploadId=null;
+const syncNewOperationId=()=>crypto.randomUUID?.()||('op-'+Date.now()+'-'+Math.random().toString(36).slice(2));
 const syncKey=username=>SYNC_DRAFT_PREFIX+encodeURIComponent(username)+":"+SYNC_TAB_ID;
 const syncApi=(path,method="GET",body)=>PKApi.request(path,method,body,{timeoutMs:16000});
 const syncDraftChanges=(a,b)=>SYNC_NAMES.filter(key=>!same(a?.[key],b?.[key]));
@@ -285,7 +315,7 @@ function syncReadDrafts(username){
 function syncSaveDraft(){
   if(!authUser)return true;
   const draft={schema:2,username:authUser,tabId:SYNC_TAB_ID,savedAt:Date.now(),
-    version:stateVersion,base:structuredClone(baseState||{}),state:snapshot()};
+    version:stateVersion,operationId:syncUploadId,base:structuredClone(baseState||{}),state:snapshot()};
   try{
     localStorage.setItem(syncKey(authUser),JSON.stringify(draft));
     syncStorageError=false;
@@ -296,14 +326,14 @@ function syncSaveDraft(){
     return false;
   }
 }
-function syncClearAcknowledgedDrafts(){
+function syncClearAcknowledgedDrafts(acceptedId=null){
   if(!authUser)return;
   try{
     // Never delete a newer draft from another tab or a later edit on this tab.
     const key=syncKey(authUser),raw=localStorage.getItem(key);
     if(raw){
       const saved=JSON.parse(raw);
-      if(saved?.username===authUser&&same(saved.state,snapshot()))
+      if(saved?.username===authUser&&(same(saved.state,snapshot())||(acceptedId&&saved.operationId===acceptedId)))
         localStorage.removeItem(key);
     }
     for(const entry of syncRecoveredDrafts){
@@ -322,8 +352,35 @@ function mergeEditorDrafts(base,local,remote){
   }
   return result;
 }
+function syncAdoptedSignature(state){
+  const memory=state?.settings?.inverseMemory;
+  if(!memory||typeof memory!=="object"||Array.isArray(memory))return "[]";
+  // Never include actual records, dosage details or private account fields in
+  // a cross-component event. Only compare the locally held state.
+  return JSON.stringify(Object.entries(memory).filter(([,entry])=>
+    entry?.adoptedPointPlan&&typeof entry.adoptedPointPlan==="object")
+    .sort(([a],[b])=>a.localeCompare(b))
+    .map(([drug,entry])=>[drug,entry.adoptedPointPlan]));
+}
+function syncAdoptedChanged(version){
+  const message="已接收另一设备对已采用方案的修改，曲线与自动提醒已重新同步。";
+  for(const id of ["adoptedSyncNotice","adoptedSyncToast"]){
+    const notice=$(id);
+    if(notice){notice.textContent=message;notice.hidden=false;}
+  }
+  clearTimeout(syncAdoptedChanged.hideTimer);
+  syncAdoptedChanged.hideTimer=setTimeout(()=>{
+    for(const id of ["adoptedSyncNotice","adoptedSyncToast"]){
+      const notice=$(id);if(notice)notice.hidden=true;
+    }
+  },12000);
+  window.dispatchEvent(new CustomEvent("pk-atlas-adopted-plan-changed",{
+    detail:{source:"server",version}
+  }));
+}
 function syncApplyMerged(state){
   records=safeRecords(state.records);
+  scheduledDoses=safeScheduledDoses(state.settings?.scheduledDoses);
   courses=safeCourses(state.courses);
   intakes=safeIntakes(state.intakes);
   plans=state.plans&&typeof state.plans==="object"&&!Array.isArray(state.plans)?state.plans:{};
@@ -361,6 +418,7 @@ function persist(){
   mealMatchCache.clear();
   if(authUser){
     syncRevision++;
+    syncUploadId=syncNewOperationId();
     syncLastEditAt=Date.now();
     const safe=syncSaveDraft();
     syncPending=true;
@@ -370,6 +428,7 @@ function persist(){
   }else{
     setStored(RECORD_KEY,JSON.stringify(records));setStored(COURSE_KEY,JSON.stringify(courses));
     setStored(PLAN_KEY,JSON.stringify(plans));setStored(INTAKE_KEY,JSON.stringify(intakes));
+    setStored("pk-atlas-planned-doses-v1",JSON.stringify(scheduledDoses));
     setStored(RENAL_KEY,JSON.stringify(renal));
   }
   if(!authUser){
@@ -380,142 +439,99 @@ function persist(){
 async function syncRecoverPending(){
   if(!authUser)return;
   const drafts=syncReadDrafts(authUser);
-  if(!drafts.length){
-    syncSetStatus("synced","已读取云端最新数据");
-    return;
-  }
-  let merged=structuredClone(baseState);
-  for(const entry of drafts){
-    const proposed=mergeState(entry.draft.base,entry.draft.state,merged);
-    if(!proposed){syncRecoveredDrafts=drafts;syncConflictNotice();return}
-    merged=proposed;
-  }
+  const pending=drafts.filter(item=>syncDraftChanges(item.draft.base,item.draft.state).length);
+  if(!pending.length){syncSetStatus("synced","已读取云端最新数据");return}
+  // Only the latest LOCAL draft wins. Never union deleted records back in.
+  const newest=pending[pending.length-1];
   syncRecoveredDrafts=drafts;
-  if(syncDraftChanges(baseState,merged).length){
-    syncApplyMerged(merged);
-    syncRevision++;
-    syncPending=true;
-    syncSaveDraft();
-    syncSetStatus("pending",`发现 ${drafts.length} 份未同步草稿，已安全合并，正在补传云端…`);
-    syncSchedule(80);
-  }else{
-    syncClearAcknowledgedDrafts();
-    syncSetStatus("synced","本机草稿与云端一致，已核对");
-  }
+  syncApplyMerged(newest.draft.state);
+  syncUploadId=newest.draft.operationId||syncNewOperationId();
+  syncRevision++;syncPending=true;syncSaveDraft();
+  syncSetStatus("pending","恢复未上传的完整本机草稿，等待最后上传优先同步");
+  syncSchedule(80);
 }
 async function flushSync(){
   clearTimeout(syncTimer);syncTimer=0;
   if(syncRunning||!authUser||appOfflineRestored||syncConflict||!syncPending)return;
   if(!navigator.onLine){syncRetryLater(new Error("offline"));return}
-  syncRunning=true;
-  syncPending=false;
-  const sent=snapshot(),base=structuredClone(baseState||{}),version=stateVersion;
-  const sections=Object.fromEntries(syncDraftChanges(base,sent).map(k=>[k,sent[k]]));
+  syncRunning=true;syncPending=false;
+  const sent=snapshot(),version=stateVersion,revision=syncRevision;
+  const adoptedBefore=syncAdoptedSignature(sent);
+  const dirty=syncDraftChanges(baseState,sent).length>0;
+  const operationId=syncUploadId||(syncUploadId=syncNewOperationId());
   try{
-    syncSetStatus("saving","正在安全同步云端…");
-    if(Object.keys(sections).length)
-      await syncApi("/api/state/sections","PUT",{version,sections});
-    // Read back the durable state; an HTTP 200 alone is not sufficient proof.
-    const verified=await syncApi("/api/state");
-    const latest=snapshot();
-    const merged=mergeState(Object.keys(sections).length?sent:base,latest,verified.state);
-    if(!merged){syncConflictNotice();return}
-    const changedMemory=!same(merged,latest);
-    baseState=structuredClone(verified.state);
-    stateVersion=verified.version;
-    offlineSaveVerified(authUser,verified.state,verified.version);
-    if(changedMemory){
-      syncApplyMerged(merged);
-      renderDrug();
-      window.dispatchEvent(new Event("pk-atlas-records-changed"));
+    if(dirty){
+      syncSetStatus("saving","上传完整快照，以服务器最后成功提交的设备为准…");
+      await syncApi("/api/state","PUT",{version,state:sent,
+        syncPolicy:"last-upload-wins-v1",operationId});
     }
-    if(syncDraftChanges(baseState,snapshot()).length){
-      syncRevision++;
-      syncPending=true;
-      syncSaveDraft();
-      syncSetStatus("pending","合并了其他设备或刚刚输入的更改，正在继续同步…");
-      syncRetryDelay=1000;
-      syncSchedule(200);
-    }else{
-      syncClearAcknowledgedDrafts();
-      syncRetryDelay=1000;
-      if(!syncStorageError)syncSetStatus("synced","所有更改已保存到云端 · 已回读核对");
-      $("syncRetry").hidden=true;
-      window.dispatchEvent(new Event("pk-atlas-records-changed"));
+    const remote=await syncApi("/api/state");
+    if(remote.syncPolicy!=="last-upload-wins-v1"){
+      syncConflictNotice();
+      syncSetStatus("conflict","服务器尚不支持最后上传优先规则，请先升级服务端。");
+      return;
     }
+    baseState=structuredClone(remote.state);
+    stateVersion=remote.version;
+    offlineSaveVerified(authUser,remote.state,remote.version);
+    if(syncRevision!==revision){
+      syncPending=true;syncSaveDraft();
+      syncSetStatus("pending","上传期间产生新修改，将继续提交较新的本机快照…");
+      syncSchedule(250);
+      return;
+    }
+    // Another device could have committed between our write and GET.
+    // In that case it has won. Do not re-upload our older snapshot.
+    syncApplyMerged(remote.state);
+    syncClearAcknowledgedDrafts(operationId);
+    syncUploadId=null;syncRetryDelay=1000;
+    renderDrug();
+    syncSetStatus("synced","已回读最后成功上传设备的完整快照");
+    $("syncRetry").hidden=true;
+    if(adoptedBefore!==syncAdoptedSignature(remote.state))syncAdoptedChanged(remote.version);
+    window.dispatchEvent(new Event("pk-atlas-records-changed"));
   }catch(error){
-    if(error.status===409&&error.data?.state&&Number.isInteger(error.data.version)){
-      const merged=mergeState(base,snapshot(),error.data.state);
-      if(!merged){syncConflictNotice();return}
-      baseState=structuredClone(error.data.state);
-      stateVersion=error.data.version;
-      syncApplyMerged(merged);
-      renderDrug();
-      syncRevision++;
-      syncPending=true;
-      syncSaveDraft();
-      syncSetStatus("pending","另一台设备已有新内容；已合并不冲突的更改，正在重试…");
-      syncSchedule(80);
+    if(error.status===409){
+      syncConflictNotice();
+      syncSetStatus("conflict","服务器仍使用旧版冲突规则，停止重试；保留本机草稿。");
     }else if(error.status===401){
       syncPending=true;
-      syncSetStatus("error","登录已过期。本机草稿已保留，请重新登录后自动恢复同步。");
-      $("authRetry").hidden=false;
-      $("syncRetry").hidden=false;
+      syncSetStatus("error","登录已过期，本机完整草稿已保留。");
+      $("authRetry").hidden=false;$("syncRetry").hidden=false;
     }else syncRetryLater(error);
   }finally{
     syncRunning=false;
-    // A new change might have arrived during the awaited request.
     if(syncPending&&!syncConflict&&!syncTimer)syncSchedule(250);
   }
 }
 async function syncPullRemote(){
   if(!authUser||appOfflineRestored||syncPulling||syncRunning||syncPending||syncConflict||!navigator.onLine)return;
-  // No redundant 30-second cloud reads while a home-screen PWA is in the
-  // background. Visibility/focus listeners refresh immediately on return.
   if(document.hidden)return;
   if(Date.now()-syncLastEditAt<3500)return;
   if(document.activeElement?.matches?.("input,textarea,select,[contenteditable=true]"))return;
-  syncPulling=true;
-  const rev=syncRevision;
+  syncPulling=true;const revision=syncRevision;
   try{
-    const data=await syncApi("/api/state");
-    if(syncRevision!==rev||syncPending||syncRunning)return;
-    if(data.version!==stateVersion){
-      const merged=mergeState(baseState,snapshot(),data.state);
-      if(!merged){syncConflictNotice();return}
-      baseState=structuredClone(data.state);
-      stateVersion=data.version;
-      syncApplyMerged(merged);
+    const remote=await syncApi("/api/state");
+    if(syncRevision!==revision||syncPending||syncRunning)return;
+    if(remote.version!==stateVersion){
+      const adoptedBefore=syncAdoptedSignature(snapshot());
+      baseState=structuredClone(remote.state);
+      stateVersion=remote.version;
+      syncApplyMerged(remote.state);
+      offlineSaveVerified(authUser,remote.state,remote.version);
       renderDrug();
-      if(syncDraftChanges(baseState,snapshot()).length){
-        syncRevision++;syncPending=true;syncSaveDraft();syncSchedule(100);
-      }else{
-        syncSetStatus("synced","已载入另一台设备的最新内容");
-        window.dispatchEvent(new Event("pk-atlas-records-changed"));
-      }
+      syncSetStatus("synced","已加载另一设备最后提交的完整版本");
+      if(adoptedBefore!==syncAdoptedSignature(remote.state))syncAdoptedChanged(remote.version);
+      window.dispatchEvent(new Event("pk-atlas-records-changed"));
     }
-  }catch{/* transient polling failures never erase local changes */ }
+  }catch{/* Poll failures never erase a local draft or upload stale data. */}
   finally{syncPulling=false}
 }
 async function syncManualRetry(){
   if(!authUser||appOfflineRestored||syncRunning)return;
-  if(syncConflict){
-    try{
-      const data=await syncApi("/api/state");
-      const drafts=syncReadDrafts(authUser);
-      let merged=structuredClone(data.state);
-      for(const entry of drafts){
-        merged=mergeState(entry.draft.base,entry.draft.state,merged);
-        if(!merged){syncConflictNotice();return}
-      }
-      syncConflict=false;
-      baseState=structuredClone(data.state);stateVersion=data.version;
-      syncApplyMerged(merged);
-      syncRecoveredDrafts=drafts;
-      renderDrug();
-    }catch(e){syncSetStatus("error",`重新核对失败：${e.message}`);return}
-  }
-  syncRevision++;syncPending=true;syncSaveDraft();syncSchedule(0);
+  syncConflict=false;syncPending=true;
+  if(!syncUploadId)syncUploadId=syncNewOperationId();
+  syncSaveDraft();syncSchedule(0);
 }
 function syncDownloadDraft(){
   if(!authUser)return;
@@ -543,7 +559,7 @@ function initSyncLifecycle(){
   });
   document.addEventListener("input",syncCaptureEditor);
   document.addEventListener("change",syncCaptureEditor);
-  setInterval(()=>{if(syncPending)syncSchedule(0);else void syncPullRemote()},30000);
+  setInterval(()=>{if(syncPending)syncSchedule(0);else void syncPullRemote()},15000);
 }
 
 
@@ -574,13 +590,23 @@ function syncClearEditorFields(ids,drug=current){
   for(const id of ids)delete fields[id];
   if(!Object.keys(fields).length)delete editorDrafts[drug];
 }
+function migrateUnconfirmedFutureRecords(){
+  const cutoff=Date.now();
+  const items=records.filter(r=>r.time>cutoff&&!isJournalArchive(r));
+  if(!items.length)return 0;
+  const ids=new Set(scheduledDoses.map(x=>x.id));
+  for(const row of items)if(!ids.has(row.id))scheduledDoses.push({id:row.id,drug:row.drug,
+    time:row.time,mg:row.mg,unit:row.unit||"mg",kind:"planned"});
+  records=records.filter(r=>!items.includes(r));
+  return items.length;
+}
 function renderChooser(){
   const dateInput=$("chooseDate");if(!dateInput)return;
   if(!dateInput.value)dateInput.value=selectedDate;
   const box=$("chooserDates");box.replaceChildren();
-  const keys=[...new Set([...records,...intakes].map(r=>dateKey(r.time)))].sort().reverse();
+  const keys=[...new Set([...records,...intakes,...scheduledDoses].map(r=>dateKey(r.time)))].sort().reverse();
   if(!keys.length){const p=document.createElement("p");p.className="chooser-empty";p.textContent="还没有服用或饮食记录。选定日期后即可开始。";box.append(p)}
-  for(const key of keys){const button=document.createElement("button");button.className="chooser-card";button.type="button";const strong=document.createElement("strong"),small=document.createElement("small");strong.textContent=key;const dayRows=records.filter(r=>dateKey(r.time)===key),mealCount=intakes.filter(x=>dateKey(x.time)===key).length,names=dayDrugTotals(dayRows).map(x=>x.name),pending=dayRows.filter(r=>r.journal?.reviewStatus==="possibleDuplicate").length;small.textContent=`${dayRows.filter(r=>!isJournalReview(r)).length} 次服用${pending?` · ${pending} 条待核对`:""} · ${mealCount} 条饮食 · ${names.join("、")||"暂无已确认药物"}`;button.append(strong,small);button.onclick=()=>openCalculationDate(key);box.append(button)}
+  for(const key of keys){const button=document.createElement("button");button.className="chooser-card";button.type="button";const strong=document.createElement("strong"),small=document.createElement("small");strong.textContent=key;const dayRows=records.filter(r=>dateKey(r.time)===key),mealCount=intakes.filter(x=>dateKey(x.time)===key).length,names=dayDrugTotals(dayRows).map(x=>x.name),pending=dayRows.filter(r=>r.journal?.reviewStatus==="possibleDuplicate").length;small.textContent=`${dayRows.filter(r=>!isJournalReview(r)).length} 次服用${pending?` · ${pending} 条待核对`:""} · ${mealCount} 条饮食 · ${scheduledDoses.filter(x=>dateKey(x.time)===key).length} 条计划 · ${names.join("、")||"暂无已确认药物"}`;button.append(strong,small);button.onclick=()=>openCalculationDate(key);box.append(button)}
   const adopted=Object.entries(inverseMemory).map(([drugId,saved])=>({drugId,plan:saved?.adoptedPointPlan})).filter(x=>x.plan&&DRUGS.some(d=>d.id===x.drugId)).sort((a,b)=>(b.plan.adoptedAt||0)-(a.plan.adoptedAt||0));
   $("adoptedPlans").hidden=!adopted.length;
   const adoptedList=$("adoptedPlanList");adoptedList.replaceChildren();
@@ -600,6 +626,7 @@ function openCalculationDate(key,newDose=false){
 }
 function applyAccountState(state,version){
   records=safeRecords(state.records);courses=safeCourses(state.courses);
+  scheduledDoses=safeScheduledDoses(state.settings?.scheduledDoses);
   intakes=safeIntakes(state.intakes);mealMatchCache.clear();
   plans=state.plans&&typeof state.plans==="object"&&!Array.isArray(state.plans)?state.plans:{};
   renal=safeRenal(state.settings?.renal);
@@ -609,6 +636,8 @@ function applyAccountState(state,version){
   for(const saved of Object.values(inverseMemory)){const plan=saved.adoptedPointPlan;if(plan&&plan.mealSignature===undefined)plan.mealSignature=mealScenarioSignature(plan.drug,plan.adoptedAt,plan.target)}
   if(DRUGS.some(d=>d.id===state.settings?.currentDrug))current=state.settings.currentDrug;
   stateVersion=version;baseState=structuredClone({records,courses,plans,intakes,settings:{...state.settings,currentDrug:current,renal}});
+  const converted=migrateUnconfirmedFutureRecords();
+  if(converted){syncSetStatus("pending",`发现 ${converted} 条未来时间旧记录，已转为计划服用并等待云端同步`);persist();}
   activeCourseId="";$("drug").value=current;resetDoseEdit();renderDrug();
 }
 async function loadAccount(prefetched=null){
@@ -622,9 +651,9 @@ async function loadAccount(prefetched=null){
   $("authForm").hidden=true;$("accountActions").hidden=false;$("accountTools").hidden=false;$("accountTools").open=false;
   window.dispatchEvent(new Event("pk-atlas-login"));
   await syncRecoverPending();
-  let guestRecords=[],guestCourses=[],guestIntakes=[],guestRenal=null,draft=null;
-  try{guestRecords=safeRecords(JSON.parse(getStored(RECORD_KEY)||"[]"));guestCourses=safeCourses(JSON.parse(getStored(COURSE_KEY)||"[]"));guestIntakes=safeIntakes(JSON.parse(getStored(INTAKE_KEY)||"[]"));guestRenal=safeRenal(JSON.parse(getStored(RENAL_KEY)||"null"));draft=JSON.parse(getStored(DRAFT_KEY)||"null")}catch{}
-  $("importLocal").hidden=!guestRecords.length&&!guestCourses.length&&!guestIntakes.length&&!guestRenal;
+  let guestRecords=[],guestCourses=[],guestIntakes=[],guestScheduled=[],guestRenal=null,draft=null;
+  try{guestRecords=safeRecords(JSON.parse(getStored(RECORD_KEY)||"[]"));guestCourses=safeCourses(JSON.parse(getStored(COURSE_KEY)||"[]"));guestIntakes=safeIntakes(JSON.parse(getStored(INTAKE_KEY)||"[]"));guestScheduled=safeScheduledDoses(JSON.parse(getStored("pk-atlas-planned-doses-v1")||"[]"));guestRenal=safeRenal(JSON.parse(getStored(RENAL_KEY)||"null"));draft=JSON.parse(getStored(DRAFT_KEY)||"null")}catch{}
+  $("importLocal").hidden=!guestRecords.length&&!guestCourses.length&&!guestIntakes.length&&!guestScheduled.length&&!guestRenal;
   if(!syncPending&&!syncConflict){
     syncSetStatus("synced",incomingLocalTransfer()?"已接收本机数据，请确认保存到云端。":"已连接账号 · 云端数据已核对");
   }
@@ -632,13 +661,13 @@ async function loadAccount(prefetched=null){
   const todayRows=records.filter(r=>dateKey(r.time)===today).sort((a,b)=>b.time-a.time);
   if(todayRows.length){const latestKnown=todayRows.find(r=>DRUGS.some(d=>d.id===r.drug));if(latestKnown)current=latestKnown.drug;$("drug").value=current;openCalculationDate(today)}
   else openCalculationDate(today);
-  if(incomingLocalTransfer())setTimeout(()=>$("saveLocalCloud").click(),0);
+  if(incomingLocalTransfer())setSyncStatus("历史数据已暂存。请先核对，再手动点击『保存本地数据至云端』。",false);
 }
 async function initAuth(){
   initDeviceSessionUI();
-  $("transferLocal").hidden=location.origin==="https://example.invalid";
+  $("transferLocal").hidden=location.origin==="https://pk.example.com";
   $("transferLocal").addEventListener("click",startLocalTransfer);
-  if(location.origin!=="https://example.invalid"){
+  if(location.origin!=="https://pk.example.com"){
     $("authForm").hidden=true;$("authRetry").hidden=true;$("accountName").textContent="本机记录";
     setSyncStatus("点击下方按钮，在正式网站登录并保存本机记录。");showStage("auth");return;
   }
@@ -704,7 +733,8 @@ async function initAuth(){
       // Auth response includes the initial versioned snapshot. One HTTPS
       // request replaces sequential /api/login + /api/state.
       const result=await api(action==="register"?"/api/register":"/api/login","POST",
-        {username,password,remember:$("sessionRemember").checked});
+        {username,password,remember:$("sessionRemember").checked,
+         ...(await browserDeviceMetadata())});
       $("accountPassword").value="";
       authUser=result.username;
       appRememberSession(result);
@@ -734,21 +764,22 @@ async function initAuth(){
     }catch{}
     window.dispatchEvent(new Event("pk-atlas-logout"));
     appForgetSession();
-    authUser=null;syncConflict=false;syncPending=false;syncRecoveredDrafts=[];editorDrafts={};records=safeRecords(JSON.parse(getStored(RECORD_KEY)||"[]"));courses=safeCourses(JSON.parse(getStored(COURSE_KEY)||"[]"));plans=JSON.parse(getStored(PLAN_KEY)||"{}");intakes=safeIntakes(JSON.parse(getStored(INTAKE_KEY)||"[]"));renal=safeRenal(JSON.parse(getStored(RENAL_KEY)||"null"));referenceMemory={};inverseMemory={};localStorage.removeItem("pk-atlas-reference-by-drug-v1");localStorage.removeItem("pk-atlas-inverse-by-drug-v1");mealMatchCache.clear();
+    authUser=null;syncConflict=false;syncPending=false;syncRecoveredDrafts=[];editorDrafts={};records=safeRecords(JSON.parse(getStored(RECORD_KEY)||"[]"));courses=safeCourses(JSON.parse(getStored(COURSE_KEY)||"[]"));plans=JSON.parse(getStored(PLAN_KEY)||"{}");intakes=safeIntakes(JSON.parse(getStored(INTAKE_KEY)||"[]"));scheduledDoses=safeScheduledDoses(JSON.parse(getStored("pk-atlas-planned-doses-v1")||"[]"));renal=safeRenal(JSON.parse(getStored(RENAL_KEY)||"null"));referenceMemory={};inverseMemory={};localStorage.removeItem("pk-atlas-reference-by-drug-v1");localStorage.removeItem("pk-atlas-inverse-by-drug-v1");mealMatchCache.clear();
     $("authForm").hidden=false;$("accountActions").hidden=true;$("accountTools").hidden=true;$("accountTools").open=false;$("accountName").textContent="未登录";setSyncStatus("请登录后查看和同步记录");activeCourseId="";renderDrug();showStage("auth");
   });
   $("importLocal").addEventListener("click",()=>{
-    if(!authUser||!confirm("将当前浏览器保存的服用、饮食记录、药盒规格和肌酐清除率合并到已登录账号？"))return;
-    const localRecords=safeRecords(JSON.parse(getStored(RECORD_KEY)||"[]")),localCourses=safeCourses(JSON.parse(getStored(COURSE_KEY)||"[]")),localPlans=JSON.parse(getStored(PLAN_KEY)||"{}"),localIntakes=safeIntakes(JSON.parse(getStored(INTAKE_KEY)||"[]")),localRenal=safeRenal(JSON.parse(getStored(RENAL_KEY)||"null"));
+    if(!authUser||!confirm("将当前浏览器保存的服用、计划服用、饮食记录、药盒规格和肾功能模型参数合并到已登录账号？"))return;
+    const localRecords=safeRecords(JSON.parse(getStored(RECORD_KEY)||"[]")),localCourses=safeCourses(JSON.parse(getStored(COURSE_KEY)||"[]")),localPlans=JSON.parse(getStored(PLAN_KEY)||"{}"),localIntakes=safeIntakes(JSON.parse(getStored(INTAKE_KEY)||"[]")),localScheduled=safeScheduledDoses(JSON.parse(getStored("pk-atlas-planned-doses-v1")||"[]")),localRenal=safeRenal(JSON.parse(getStored(RENAL_KEY)||"null"));
     const cr=new Map(courses.map(x=>[x.id,x]));for(const x of localCourses)if(!cr.has(x.id))cr.set(x.id,x);courses=[...cr.values()];
     const rr=new Map(records.map(x=>[x.id,x]));for(const x of localRecords)if(!rr.has(x.id))rr.set(x.id,x);records=[...rr.values()];
     const ii=new Map(intakes.map(x=>[x.id,x]));for(const x of localIntakes)if(!ii.has(x.id))ii.set(x.id,x);intakes=[...ii.values()];
+    const pp=new Map(scheduledDoses.map(x=>[x.id,x]));for(const x of localScheduled)if(!pp.has(x.id))pp.set(x.id,x);scheduledDoses=[...pp.values()];
     for(const [key,value] of Object.entries(localPlans))if(!Object.hasOwn(plans,key))plans[key]=value;
     if(!renal&&localRenal)renal=localRenal;
     persist();renderDrug();setSyncStatus("已合并本机记录，正在同步…");
   });
   $("saveLocalCloud").addEventListener("click",async()=>{
-    if(location.origin!=="https://example.invalid"){startLocalTransfer();return}
+    if(location.origin!=="https://pk.example.com"){startLocalTransfer();return}
     if(!authUser){setSyncStatus("请先登录正式网站，再保存本机数据。",true);return}
     if(syncRunning){setSyncStatus("当前同步尚未结束，请稍后再保存本机数据。",true);return}
     let draftText=getStored(DRAFT_KEY),draft=null;
@@ -761,7 +792,7 @@ async function initAuth(){
       let remote=await api("/api/state");
       const localIds=new Set((local.records||[]).map(row=>row.id));
       const cloudOnly=(remote.state.records||[]).filter(row=>!localIds.has(row.id)).length;
-      const message=`将${incoming?`来自 ${incoming.sourceUsername||"本机旧页面"} 的`:"本机当前账号"}数据保存到 ${authUser} 的云端账号？\n本机：${(local.records||[]).length} 条服用、${(local.intakes||[]).length} 条饮食。药盒规格、参考值和已采用情景也会保存。\n云端独有的 ${cloudOnly} 条服用记录会保留；同一记录如两端不同，以本机内容为准。`;
+      const message=`将${incoming?`来自 ${incoming.sourceUsername||"本机旧页面"} 的`:"本机当前账号"}数据保存到 ${authUser} 的云端账号？\n本机：${(local.records||[]).length} 条已服用、${(local.settings?.scheduledDoses||[]).length} 条计划、${(local.intakes||[]).length} 条饮食。药盒规格、参考值和已采用情景也会保存。\n云端独有的 ${cloudOnly} 条服用记录会保留；同一记录如两端不同，以本机内容为准。`;
       if(!confirm(message)){setSyncStatus("已取消保存，本机数据未改动。");return}
       let uploaded=null,version=null;
       for(let attempt=0;attempt<3;attempt++){
@@ -790,7 +821,7 @@ async function initAuth(){
   await restore();
 
 }
-let editingDoseId="",editingCourseId="",editingIntakeId="",timeTouched=false,previousUnit="mg";
+let editingDoseId="",editingScheduledId="",editingAdoptedIndex=null,editingAdoptedAdjustmentIndex=null,editingCourseId="",editingIntakeId="",timeTouched=false,previousUnit="mg";
 const unitByDrug={};
 function chosen(){return DRUGS.find(d=>d.id===current)}
 function allRows(){return records.filter(r=>r.drug===current)}
@@ -893,6 +924,134 @@ function renderDrug(){
   $("sourceList").innerHTML=`<div class="source-row"><strong>${d.name}</strong><span>${d.form} · Cmax ${d.cmaxRange} · Tmax ${d.tmaxRange} · t½ ${fmt(d.halfLife)} h</span><a href="${d.url}" target="_blank" rel="noopener noreferrer">查看 ${d.source} ↗</a></div>${d.cmaxUrl?`<div class="source-row"><strong>模型校准</strong><span>达峰范围来自多研究汇总；绝对峰值来自另一项 22 人单剂量研究，未做同一人群联合拟合。</span><a href="${d.tmaxUrl}" target="_blank" rel="noopener noreferrer">达峰研究 ↗</a><a href="${d.cmaxUrl}" target="_blank" rel="noopener noreferrer">峰值研究 ↗</a></div>`:""}<div class="source-row"><strong>饮食影响</strong><span>${food.summary}</span><a href="${food.url}" target="_blank" rel="noopener noreferrer">查看 ${food.source} ↗</a></div>`;
   renderRenal();renderFoodEvidence();
   loadPlanForCurrent();syncRestoreEditor();render();
+}
+function editAdoptedNode(plan,index){
+  if(!plan||!Array.isArray(plan.doses)||!plan.doses[index])return;
+  const dose=plan.doses[index];
+  if(current!==plan.drug){current=plan.drug;$("drug").value=current;$("calcDrug").value=current;renderDrug()}
+  editingDoseId="";editingScheduledId="";editingAdoptedAdjustmentIndex=null;editingAdoptedIndex=index;
+  selectedDate=dateKey(dose.time);selectedDateFollowsToday=selectedDate===dateKey(Date.now());
+  $("doseTime").value=localInput(dose.time);setDoseEditor("mg",dose.mg);timeTouched=true;
+  $("doseCancel").hidden=false;$("doseDelete").hidden=false;doseSaveHint();
+  if(document.body.classList.contains("app-mode"))appOpenSheet("dose",{editing:true});
+  else{setMobilePane("records");$("doseForm").scrollIntoView({behavior:"smooth",block:"center"})}
+}
+function editAdoptedAdjustmentNode(plan,index){
+  const dose=plan?.adjustment?.doses?.[index];if(!dose)return;
+  if(current!==plan.drug){current=plan.drug;$("drug").value=current;$("calcDrug").value=current;renderDrug()}
+  editingDoseId="";editingScheduledId="";editingAdoptedIndex=null;editingAdoptedAdjustmentIndex=index;
+  selectedDate=dateKey(dose.time);selectedDateFollowsToday=selectedDate===dateKey(Date.now());
+  $("doseTime").value=localInput(dose.time);setDoseEditor("mg",dose.mg);timeTouched=true;
+  $("doseCancel").hidden=false;$("doseDelete").hidden=false;doseSaveHint();
+  if(document.body.classList.contains("app-mode"))appOpenSheet("dose",{editing:true});
+  else{setMobilePane("records");$("doseForm").scrollIntoView({behavior:"smooth",block:"center"})}
+}
+function updateAdoptedAdjustmentNodeFromEditor(index,time,mg){
+  const plan=adoptedPlan();if(!plan?.adjustment?.doses?.[index])return false;
+  if(time>plan.target){alert("调整节点晚于方案目标时刻，请调整后重试。");return false}
+  plan.adjustment.doses[index]={...plan.adjustment.doses[index],time,mg};
+  delete plan.adjustment.doses[index].parts;
+  plan.adjustment.doses.sort((a,b)=>a.time-b.time);
+  plan.adjustment.adoptedAt=Date.now();persist();renderDrug();return true;
+}
+function deleteAdoptedAdjustmentNodeFromEditor(index){
+  const plan=adoptedPlan();if(!plan?.adjustment?.doses?.[index])return false;
+  plan.adjustment.doses.splice(index,1);plan.adjustment.adoptedAt=Date.now();
+  persist();renderDrug();return true;
+}
+function updateAdoptedNodeFromEditor(index,time,mg){
+  const plan=adoptedPlan();if(!plan||!Array.isArray(plan.doses)||!plan.doses[index])return false;
+  if(time>plan.target){alert("修改时间晚于已采用方案的目标时刻，请先调整目标时刻。");return false}
+  // Reorder chronological nodes and shift manual record links by original
+  // index. The edited node's old link and stale adjustment are invalidated.
+  const sorted=plan.doses.map((dose,old)=>({...dose,_old:old}));
+  sorted[index]={...sorted[index],time,mg};delete sorted[index].parts;
+  sorted.sort((a,b)=>a.time-b.time||a._old-b._old);
+  const manual={};
+  for(const [pos,node] of sorted.entries()){
+    if(node._old!==index&&Object.hasOwn(plan.manualMatches||{},node._old))
+      manual[pos]=plan.manualMatches[node._old];
+    delete node._old;
+  }
+  plan.doses=sorted;plan.manualMatches=manual;delete plan.adjustment;
+  persist();renderDrug();return true;
+}
+function deleteAdoptedNodeFromEditor(index){
+  const plan=adoptedPlan();if(!plan||!Array.isArray(plan.doses)||!plan.doses[index])return false;
+  const next=plan.doses.filter((_,i)=>i!==index);
+  const manual={};for(const [key,value] of Object.entries(plan.manualMatches||{})){
+    const n=Number(key);if(Number.isInteger(n)&&n!==index)manual[n>index?n-1:n]=value;
+  }
+  if(!next.length)delete inverseMemory[current].adoptedPointPlan;
+  else{plan.doses=next;plan.manualMatches=manual;delete plan.adjustment;}
+  persist();renderDrug();return true;
+}
+function openAdoptedTakenEditor(plan,dose,matched){
+  if(matched){editRecord(matched.record.id);return}
+  if(current!==plan.drug){current=plan.drug;$("drug").value=current;$("calcDrug").value=current;renderDrug()}
+  resetDoseEdit();$("doseTime").value=localInput(dose.time);setDoseEditor("mg",dose.mg);
+  timeTouched=true;doseSaveHint();
+  if(document.body.classList.contains("app-mode"))appOpenSheet("dose");
+  else{setMobilePane("records");$("doseForm").scrollIntoView({behavior:"smooth",block:"center"})}
+}
+function openAdoptedNotTakenEditor(plan,index,dose,matched){
+  if(matched){editRecord(matched.record.id);return}
+  const stored=scheduledDoses.find(x=>x.drug===plan.drug&&
+    Math.abs(x.time-dose.time)<=60000&&Math.abs(x.mg-dose.mg)<.0001);
+  if(stored)editScheduledDose(stored.id);
+  else editAdoptedNode(plan,index);
+}
+function doseSaveHint(){
+  const at=new Date($("doseTime")?.value||"").getTime();
+  const planning=editingAdoptedIndex!==null||editingAdoptedAdjustmentIndex!==null||!!editingScheduledId||Number.isFinite(at)&&at>Date.now();
+  const notice=$("doseFutureNotice");
+  if(notice)notice.textContent=(editingAdoptedIndex!==null||editingAdoptedAdjustmentIndex!==null)
+    ? "修改已采用方案的计划节点，不登记为实际服用。可用下方删除按钮移除此节点。"
+    : planning
+    ? "计划服用：仅保存为预计节点，参加虚线预测和反算条件。不计为实际服用，过期也不会自动完成。"
+    : "已服用记录：所选时间为过去或现在，保存后将参加真实记录的数学曲线。";
+  const button=$("doseSubmit");if(button)button.textContent=(editingAdoptedIndex!==null||editingAdoptedAdjustmentIndex!==null)?"保存已采用节点修改":planning?"保存计划服用":"保存实际服用";
+}
+function renderScheduledDoses(){
+  const box=$("scheduledDoseList");if(!box)return;
+  box.replaceChildren();
+  const rows=scheduledDoses.filter(r=>dateKey(r.time)===selectedDate).sort((a,b)=>a.time-b.time);
+  if(!rows.length){const empty=document.createElement("p");empty.className="hint";empty.textContent="本日没有计划服用；其他日期的计划可通过日期选择查看。";box.append(empty);return}
+  for(const dose of rows){
+    const el=document.createElement("div");el.className="record planned-dose-item";
+    const info=document.createElement("div"),name=DRUGS.find(x=>x.id===dose.drug)?.name||dose.drug;
+    const strong=document.createElement("strong");strong.textContent=`${name} · ${fmt(dose.mg,3)} mg · 计划`;
+    const detail=document.createElement("small");detail.textContent=`${fullDate(dose.time)} · ${dose.time<=Date.now()?"计划已到时，尚未确认":"尚未发生"} · 不计入真实记录`;
+    info.append(strong,detail);const controls=document.createElement("div");controls.className="record-actions";
+    const edit=document.createElement("button");edit.type="button";edit.textContent="编辑";edit.onclick=()=>editScheduledDose(dose.id);controls.append(edit);
+    if(dose.time<=Date.now()){
+      const done=document.createElement("button");done.type="button";done.textContent="确认已服用";
+      done.onclick=()=>confirmScheduledTaken(dose.id);controls.append(done)
+    }
+    const del=document.createElement("button");del.type="button";del.textContent="删除";
+    del.onclick=()=>{if(!confirm("删除此条计划服用？不会修改已有实际记录。"))return;
+      scheduledDoses=scheduledDoses.filter(d=>d.id!==dose.id);if(editingScheduledId===dose.id)resetDoseEdit();persist();renderDrug()};
+    controls.append(del);el.append(info,controls);box.append(el);
+  }
+}
+function editScheduledDose(id){
+  const entry=scheduledDoses.find(d=>d.id===id);if(!entry)return;
+  if(current!==entry.drug){current=entry.drug;$("drug").value=current;$("calcDrug").value=current;renderDrug()}
+  selectedDate=dateKey(entry.time);selectedDateFollowsToday=selectedDate===dateKey(Date.now());
+  editingDoseId="";editingAdoptedIndex=null;editingAdoptedAdjustmentIndex=null;editingScheduledId=id;$("doseTime").value=localInput(entry.time);
+  setDoseEditor(entry.unit==="g"?"g":"mg",entry.mg);
+  $("doseCancel").hidden=false;$("doseDelete").hidden=false;doseSaveHint();
+  if(document.body.classList.contains("app-mode"))appOpenSheet("dose",{editing:true});
+  else{$("doseForm").scrollIntoView({behavior:"smooth",block:"center"})}
+}
+function confirmScheduledTaken(id){
+  const dose=scheduledDoses.find(d=>d.id===id);if(!dose||dose.time>Date.now())return;
+  const duplicate=records.find(r=>r.drug===dose.drug&&Math.abs(r.time-dose.time)<=300000&&Math.abs(r.mg-dose.mg)<.0001);
+  if(duplicate){alert("已有同药同剂量且时间相近的实际记录；请先核对，不自动产生第二次服用。");return}
+  if(!confirm("确认已经实际服用这一笔计划剂量？确认后才会把该笔转入真实模型；请核对药物、时间与剂量。"))return;
+  records.push({id:dose.id,drug:dose.drug,mg:dose.mg,time:dose.time,unit:dose.unit,courseId:`day-${dateKey(dose.time)}`,source:"confirmed-plan"});
+  scheduledDoses=scheduledDoses.filter(d=>d.id!==id);if(editingScheduledId===id)resetDoseEdit();
+  persist();renderDrug();
 }
 function renderRecords(){
   const box=$("recordList"),summary=$("dayRecordSummary"),rows=records.filter(r=>dateKey(r.time)===selectedDate).sort((a,b)=>a.time-b.time),totals=dayDrugTotals(rows);
@@ -1136,9 +1295,23 @@ function referenceSetting(){
 }
 function modelValue(drug,time,rows,mode="blood"){return mode==="equivalent"?totalEquivalent(drug,time,rows):concentration(drug,time,rows)}
 function doseModelValue(drug,mg,doseTime,time,mode="blood"){return mode==="equivalent"?doseEquivalent(drug,{time:doseTime,mg},time):singleConcentration(drug,mg,(time-doseTime)/3600000,doseTime)}
-const INVERSE_RECORD_WINDOW_MS=48*3600000;
-function inverseRecordRows(rows,start){
-  return rows.filter(row=>row.time>=start-INVERSE_RECORD_WINDOW_MS&&row.time<=start+INVERSE_RECORD_WINDOW_MS);
+// Mathematical truncation only: 44 modeled half-lives plus the longest
+// absorption/peak-search horizon. Not an elimination time or clinical interval.
+const PK_MODELED_RESIDUAL_HALFLIVES=44;
+function residualWindowHours(drug){
+  if(!drug||drug.recordOnly)return Infinity;
+  const p=modelParams(drug),effective=effectiveHalfLife(drug);
+  if(!(effective>0&&Number.isFinite(effective)))return Infinity;
+  const absorption=[p.ka,...p.fed.map(part=>part.ka),...p.fedHighFat.map(part=>part.ka)];
+  let slowest=effective;
+  for(const ka of absorption){if(!(ka>0&&Number.isFinite(ka)))return Infinity;
+    slowest=Math.max(slowest,Math.LN2/ka)}
+  const peakHorizon=Math.min(72,Math.max(12,drug.tmax*8,effective*3));
+  return peakHorizon+PK_MODELED_RESIDUAL_HALFLIVES*slowest;
+}
+function inverseRecordRows(rows,start,drug=DRUGS.find(item=>item.id===current)){
+  const lookback=residualWindowHours(drug)*3600000;
+  return rows.filter(row=>row.time>=start-lookback);
 }
 function svgEl(tag,attrs={}){const el=document.createElementNS("http://www.w3.org/2000/svg",tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,String(v));return el}
 let chartView=null,probeResetTimer=null,probeManual=false,targetStartTouched=false,pointTargetTouched=false,pointScenario=null,minimumPointScenario=null,appliedPointScenario=null,inverseScenario=null,referencePending=false;
@@ -1883,6 +2056,24 @@ function matchAdoptedPlanRecords(plan,newRows,manual){
   const matchedNodeCount=new Set(completed.map(item=>item.nodeIndex)).size;
   return{usedRecords,usedNodes,completed,matchedNodeCount,invalidManual:[...new Set(invalidManual)]};
 }
+function adoptedIncludedScheduledDoses(plan,actualRows=records,adoptedRows=[]){
+  // Snapshot taken at adoption. Legacy plans without this field are treated
+  // as unknown, never guessed from today's schedule or account history.
+  if(!plan||!Array.isArray(plan.includedScheduledDoses))return [];
+  const matched=[];
+  for(const item of plan.includedScheduledDoses){
+    if(!item||item.drug!==plan.drug||typeof item.id!=="string"||
+      !Number.isFinite(item.time)||!Number.isFinite(item.mg)||item.mg<=0||item.mg>=100000||
+      item.time>plan.target)continue;
+    const isSame=(other)=>other&&(!other.drug||other.drug===item.drug)&&
+      (other.id===item.id||
+       Math.abs(other.time-item.time)<=60000&&Math.abs(other.mg-item.mg)<.0001);
+    if(actualRows.some(isSame)||adoptedRows.some(isSame)||matched.some(isSame))continue;
+    matched.push({id:item.id,drug:item.drug,time:item.time,mg:item.mg,
+      unit:item.unit||"mg",planningOnly:true,adoptedIncluded:true});
+  }
+  return matched;
+}
 function evaluateAdoptedPlan(plan,now=Date.now()){
   const drug=DRUGS.find(d=>d.id===plan.drug),baselineIds=new Set(plan.baselineIds||[]);
   const foodChanged=typeof plan.mealSignature==="string"&&plan.mealSignature!==mealScenarioSignature(plan.drug,plan.adoptedAt,plan.target);
@@ -1899,52 +2090,63 @@ function evaluateAdoptedPlan(plan,now=Date.now()){
   const recordedGap=Math.max(30*60000,(Number(plans[plan.drug]?.interval)||0)*3600000);
   const replanFrom=Math.max(now,...completed.map(match=>match.record.time+recordedGap));
   const adjustment=plan.adjustment;
-  let pending=adjustment?.doses?adjustment.doses.slice(Math.max(0,matchedNodeCount-adjustment.completedCount)).filter(dose=>dose.time>=now-60000):plan.doses.filter((dose,i)=>!usedNodes.has(i)&&dose.time>=now-60000);
+  // Every unconfirmed adopted node survives its planned timestamp. An
+  // overdue 14:00 node is still pending review at 14:01, 15:00 or tomorrow.
+  // The adopted scenario stays hypothetical until the actual entry is saved.
+  let pending=adjustment?.doses?adjustment.doses.slice(Math.max(0,matchedNodeCount-adjustment.completedCount)):plan.doses.filter((dose,i)=>!usedNodes.has(i));
+  // Only entries explicitly captured when adopting this result may be
+  // treated as fixed future inputs in the adopted graph. Fresh unrelated
+  // schedules await an actual-taken confirmation before entering the graph.
+  const additionalPlans=adoptedIncludedScheduledDoses(plan,rows,pending);
+  const searchRows=[...rows,...additionalPlans];
   let suggested=null,replanReason="";
   if(newRows.length||Object.keys(manual).length||foodChanged){
     suggested=[];
     if(remaining===0&&modelValue(drug,plan.target,rows,plan.mode)<plan.threshold-1e-6)replanReason="count";
     if(remaining>0&&plan.target<=replanFrom&&modelValue(drug,plan.target,rows,plan.mode)<plan.threshold-1e-6)replanReason="time";
     if(plan.target>replanFrom&&remaining>0){
-      let result=solveFixedContinuousPoint(drug,rows,plan.threshold,plan.target,cap,replanFrom,remaining,plan.mode,peakFloor);
-      result=enforcePointConstraints(drug,rows,result,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining);
+      let result=solveFixedContinuousPoint(drug,searchRows,plan.threshold,plan.target,cap,replanFrom,remaining,plan.mode,peakFloor);
+      result=enforcePointConstraints(drug,searchRows,result,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining);
       if(!result?.reason&&result.mg>totalCap+1e-6){
-        const slim=solveMinimumPoint(drug,rows,plan.threshold,plan.target,cap,replanFrom,result,remaining,plan.mode,peakFloor);
-        result=enforcePointConstraints(drug,rows,slim,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining,totalCap)||{reason:"totalNoSolution"};
+        const slim=solveMinimumPoint(drug,searchRows,plan.threshold,plan.target,cap,replanFrom,result,remaining,plan.mode,peakFloor);
+        result=enforcePointConstraints(drug,searchRows,slim,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining,totalCap)||{reason:"totalNoSolution"};
         if(result.reason)result={reason:"totalNoSolution"};
       }else if(!result?.reason){
-        result=enforcePointConstraints(drug,rows,result,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining,totalCap);
+        result=enforcePointConstraints(drug,searchRows,result,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining,totalCap);
       }
       if(result.reason)replanReason=result.reason;
       else if(result.continuousFrom===null)replanReason="coverage";
       else{
         if(plan.variant==="B"&&result.doses.length){
           const primary=result;
-          const minimum=solveMinimumPoint(drug,rows,plan.threshold,plan.target,cap,replanFrom,primary,remaining,plan.mode,peakFloor);
-          const flat=solveFlattestPoint(drug,rows,plan.threshold,plan.target,cap,replanFrom,primary,minimum,remaining,plan.mode,peakFloor,cycleFloor,peakRequirement,totalCap);
+          const minimum=solveMinimumPoint(drug,searchRows,plan.threshold,plan.target,cap,replanFrom,primary,remaining,plan.mode,peakFloor);
+          const flat=solveFlattestPoint(drug,searchRows,plan.threshold,plan.target,cap,replanFrom,primary,minimum,remaining,plan.mode,peakFloor,cycleFloor,peakRequirement,totalCap);
           result=flat||primary;
         }else if(plan.variant==="C"&&result.doses.length){
-          const minimum=solveMinimumPoint(drug,rows,plan.threshold,plan.target,cap,replanFrom,result,remaining,plan.mode,peakFloor);
-          const checked=enforcePointConstraints(drug,rows,minimum,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining,totalCap);
+          const minimum=solveMinimumPoint(drug,searchRows,plan.threshold,plan.target,cap,replanFrom,result,remaining,plan.mode,peakFloor);
+          const checked=enforcePointConstraints(drug,searchRows,minimum,plan.threshold,plan.target,cap,replanFrom,plan.mode,cycleFloor,peakRequirement,remaining,totalCap);
           if(checked&&!checked.reason)result=checked;
         }
         suggested=result.doses;
       }
     }
   }
-  const combined=[...rows,...pending],sample=5*60000,intervalStart=Math.min(now,plan.target);
+  // Already-saved future intakes remain fixed scenario conditions; they are
+  // never counted as a real taken dose. Avoid double-counting an adopted
+  // node that already represents the same saved future plan.
+  const combined=[...searchRows,...pending],sample=5*60000,intervalStart=Math.min(now,plan.target);
   const points=[];for(let time=intervalStart;time<plan.target;time+=sample)points.push({time,value:modelValue(drug,time,combined,plan.mode)});
   points.push({time:plan.target,value:modelValue(drug,plan.target,combined,plan.mode)});
   let lastBelow=null;for(const point of points)if(point.value<plan.threshold-1e-6)lastBelow=point.time;
   const continuousFrom=lastBelow===null?intervalStart:lastBelow>=plan.target?null:Math.min(plan.target,lastBelow+sample);
   const modeled=points.at(-1).value;
-  const proposedRows=suggested===null?null:[...rows,...suggested];
-  const constraintStats=pointConstraintMetrics(drug,rows,pending,intervalStart,continuousFrom,plan.target,cycleFloor,peakRequirement);
+  const proposedRows=suggested===null?null:[...searchRows,...suggested];
+  const constraintStats=pointConstraintMetrics(drug,searchRows,pending,intervalStart,continuousFrom,plan.target,cycleFloor,peakRequirement);
   return{...constraintStats,at:now,replanFrom,remaining,recordSignature:adoptedRecordSignature(plan.drug),completed,matchedNodeCount,pending,suggested,missed,unmatched:newRows.filter(r=>!usedRecords.has(r.id)),candidates:newRows,invalidManual,foodChanged,replanned:!!newRows.length||!!Object.keys(manual).length||foodChanged,replanReason,plannedMg:plan.doses.reduce((sum,d)=>sum+d.mg,0),completedMg:completed.reduce((sum,d)=>sum+d.record.mg,0),pendingMg:pending.reduce((sum,d)=>sum+d.mg,0),suggestedMg:suggested?.reduce((sum,d)=>sum+d.mg,0)??null,suggestedAtTarget:proposedRows?modelValue(drug,plan.target,proposedRows,plan.mode):null,baselineNow:modelValue(drug,now,rows,plan.mode),bloodAtTarget:concentration(drug,plan.target,combined),equivalentAtTarget:totalEquivalent(drug,plan.target,combined),minLevel:Math.min(...points.map(p=>p.value)),peak:Math.max(...points.map(p=>p.value)),peakEquivalent:continuousFrom===null?0:pointEquivalentPeak(drug,rows,pending,continuousFrom,plan.target),continuousFrom,allCovered:lastBelow===null,fallingAfter:modelValue(drug,plan.target+sample,combined,plan.mode)<=modeled+1e-6};
 }
 let adoptedEvaluationCache=null;
 function currentAdoptedEvaluation(plan){
-  const now=Date.now(),key=JSON.stringify([plan,adoptedRecordSignature(plan.drug),intakes,renal,plans[plan.drug],Math.floor(now/60000)]);
+  const now=Date.now(),key=JSON.stringify([plan,adoptedRecordSignature(plan.drug),scheduledDoses,intakes,renal,plans[plan.drug],Math.floor(now/60000)]);
   if(adoptedEvaluationCache?.key!==key)adoptedEvaluationCache={key,value:evaluateAdoptedPlan(plan,now)};
   return adoptedEvaluationCache.value;
 }
@@ -1987,11 +2189,81 @@ function previewAdoptedMatches(plan){
   drawChart();
   $("chartWrap").scrollIntoView({behavior:"smooth",block:"center"});
 }
+function adoptedPendingReviewRows(plan,state,now=Date.now()){
+  if(!plan||!Array.isArray(plan.doses))return [];
+  const completed=new Set(state.completed.map(item=>item.nodeIndex));
+  const rows=[];
+  for(const [index,dose] of plan.doses.entries()){
+    if(completed.has(index)||!Number.isFinite(dose.time)||!Number.isFinite(dose.mg))continue;
+    rows.push({index,time:dose.time,mg:dose.mg,kind:"adopted",drug:plan.drug});
+  }
+  // Also keep adopted adjustment nodes in view. These are hypothetical
+  // nodes and must never be silently converted to taken records.
+  if(plan.adjustment?.doses){
+    for(const dose of state.pending){
+      if(rows.some(existing=>Math.abs(existing.time-dose.time)<=60000&&
+          Math.abs(existing.mg-dose.mg)<.0001))continue;
+      const index=plan.adjustment.doses.findIndex(original=>
+        Math.abs(original.time-dose.time)<=60000&&Math.abs(original.mg-dose.mg)<.0001);
+      if(index<0)continue;
+      rows.push({index,time:dose.time,mg:dose.mg,kind:"adjusted",drug:plan.drug});
+    }
+  }
+  for(const dose of adoptedIncludedScheduledDoses(plan,records,rows)){
+    rows.push({...dose,index:-1,kind:"included"});
+  }
+  return rows.sort((a,b)=>Number(a.time>now)-Number(b.time>now)||a.time-b.time);
+}
+function renderAdoptedPendingConfirm(plan,now=Date.now()){
+  const adoptedBox=$("adoptedPointPanel");if(!adoptedBox)return;
+  let box=$("adoptedPendingConfirmPanel");
+  if(!box){box=document.createElement("section");box.id="adoptedPendingConfirmPanel";
+    box.className="adopted-confirm-priority";box.setAttribute("aria-label","待确认服用的已采用数学节点");
+    adoptedBox.parentElement.insertBefore(box,adoptedBox)}
+  if(!plan){box.hidden=true;box.replaceChildren();return}
+  const state=currentAdoptedEvaluation(plan),list=adoptedPendingReviewRows(plan,state,now);
+  box.hidden=!list.length;if(!list.length){box.replaceChildren();return}
+  box.replaceChildren();
+  const title=document.createElement("h3");title.textContent=`待确认服用 · ${list.length} 条数学计划节点`;
+  const intro=document.createElement("p");intro.className="hint";
+  intro.textContent="即使预计时间已经过去，只要没有确认实际服用，就持续显示在已采用方案上方。未确认节点仅属于数学假设，不会记为已服用。";
+  box.append(title,intro);
+  for(const item of list){
+    const row=document.createElement("div");row.className="adopted-confirm-row";
+    const detail=document.createElement("div");detail.className="adopted-confirm-text";
+    const name=document.createElement("strong");name.textContent=`${fullDate(item.time)} · ${fmt(item.mg,3)} mg`;
+    const status=document.createElement("small");
+    status.textContent=`${item.time<=now?"已到时 · 尚未确认":"尚未到时 · 预计节点"} · ${item.kind==="included"?"采用计算时已计入的未来计划":item.kind==="adjusted"?"已采用调整节点":"已采用原方案节点"}`;
+    detail.append(name,status);row.append(detail);
+    const controls=document.createElement("div");controls.className="adopted-confirm-actions";
+    const yes=document.createElement("button");yes.type="button";yes.className="secondary";
+    yes.textContent="是 · 确认已服用";yes.disabled=item.time>now;
+    yes.onclick=()=>{
+      const matchedPlan=scheduledDoses.find(d=>d.drug===plan.drug&&
+        (d.id===item.id||Math.abs(d.time-item.time)<=60000&&Math.abs(d.mg-item.mg)<.0001));
+      if(matchedPlan){confirmScheduledTaken(matchedPlan.id);return}
+      openAdoptedTakenEditor(plan,item,null);
+    };
+    const no=document.createElement("button");no.type="button";no.className="ghost";
+    no.textContent="否 · 修改或删除";
+    no.onclick=()=>{
+      if(item.kind==="included"){
+        const stored=scheduledDoses.find(d=>d.id===item.id);
+        if(stored)editScheduledDose(stored.id);
+        else{alert("这条计划已参与采用时的计算快照，但原计划记录已被删除。请通过重新计算并采用新方案修正，避免默默改变历史方案。");}
+      }else if(item.kind==="adjusted"){
+        editAdoptedAdjustmentNode(plan,item.index);
+      }else editAdoptedNode(plan,item.index);
+    };
+    controls.append(yes,no);row.append(controls);box.append(row);
+  }
+}
 function renderAdoptedPoint(plan){
   const panel=$("adoptedPointPanel"),out=$("adoptedPointResult"),state=currentAdoptedEvaluation(plan),reference={name:plan.mode==="equivalent"?"剂量等效量":"血药浓度",unit:plan.mode==="equivalent"?"mg（等效）":"mg/L"};
   panel.hidden=false;
+  renderAdoptedPendingConfirm(plan);
   out.replaceChildren();out.classList.add("scenario-results");
-  const intro=document.createElement("p");intro.className="scenario-intro";intro.textContent=`${targetWindow.enabled?`目标时刻限定 ${fmt(threshold,3)} ±${fmt(targetWindow.value,3)} ${unit} · `:"目标时刻至少高于参考线 · "}已采用方案 ${plan.variant||"A"}${plan.variant==="C"?"（历史方案）":""} · ${fullDate(plan.adoptedAt)} · 原方案 ${plan.doses.length} 个节点 · 目标 ${fullDate(plan.target)} · ${reference.name}参考线 ${fmt(plan.threshold,3)} ${reference.unit}${plan.cycleMin?` · 周期最低 ${fmt(plan.cycleMin,3)} ${cycleFloorUnit(plan.cycleMode)}`:""}${plan.peakMin?` · 覆盖段峰值最低 ${fmt(plan.peakMin,3)} ${cycleFloorUnit(plan.peakMode)}`:""}。后续模型节点提醒将跟随当前已采用方案和调整意见自动同步到云端；仅在设备已授权推送时送达。当前复核只读取计算起点前后各 48 小时的同药记录，更早的残留不计。实际服用记录的时间与剂量保持原样；自动重算只生成调整意见，点击采用后才替换后续预计节点。`;out.append(intro);
+  const intro=document.createElement("p");intro.className="scenario-intro";intro.textContent=`${targetWindow.enabled?`目标时刻限定 ${fmt(threshold,3)} ±${fmt(targetWindow.value,3)} ${unit} · `:"目标时刻至少高于参考线 · "}已采用方案 ${plan.variant||"A"}${plan.variant==="C"?"（历史方案）":""} · ${fullDate(plan.adoptedAt)} · 原方案 ${plan.doses.length} 个节点 · 目标 ${fullDate(plan.target)} · ${reference.name}参考线 ${fmt(plan.threshold,3)} ${reference.unit}${plan.cycleMin?` · 周期最低 ${fmt(plan.cycleMin,3)} ${cycleFloorUnit(plan.cycleMode)}`:""}${plan.peakMin?` · 覆盖段峰值最低 ${fmt(plan.peakMin,3)} ${cycleFloorUnit(plan.peakMode)}`:""}。后续模型节点提醒将跟随当前已采用方案和调整意见自动同步到云端；仅在设备已授权推送时送达。当前复核按本药数值残留窗口截取历史记录（不是生理清除或用药建议）。实际服用记录的时间与剂量保持原样；自动重算只生成调整意见，点击采用后才替换后续预计节点。`;out.append(intro);
   const metrics=document.createElement("div");metrics.className="scenario-metrics";
   for(const [label,value] of [["原方案总量",`${fmt(state.plannedMg,3)} mg`],["已记录匹配",`${state.matchedNodeCount} 个计划节点 · ${state.completed.length} 条实际记录 · ${fmt(state.completedMg,3)} mg`],["已采用后续节点",`${state.pending.length} 次 · ${fmt(state.pendingMg,3)} mg`],["已采用方案目标值",`${fmt(plan.mode==="equivalent"?state.equivalentAtTarget:state.bloodAtTarget,3)} ${reference.unit}`]]){const item=document.createElement("div"),small=document.createElement("small"),strong=document.createElement("strong");small.textContent=label;strong.textContent=value;item.append(small,strong);metrics.append(item)}out.append(metrics);
   const preview=document.createElement("button");preview.type="button";preview.className="secondary";
@@ -2013,8 +2285,20 @@ function renderAdoptedPoint(plan){
       item.textContent=(matched.manual?"手动":"自动")+"匹配 · "+fullDate(matched.record.time)+" · "+fmt(matched.record.mg,3)+" mg";
       li.append(item);
     }
+    const actions=document.createElement("fieldset"),legend=document.createElement("legend");
+    actions.className="adopted-taken-actions";legend.textContent="是否服用（仅在确认发生后登记实际记录）";actions.append(legend);
+    const taken=document.createElement("button");taken.type="button";taken.className="secondary";
+    taken.textContent="是 · 核对已服用";
+    taken.onclick=()=>openAdoptedTakenEditor(plan,dose,matches[0]||null);
+    const notTaken=document.createElement("button");notTaken.type="button";notTaken.className="ghost";
+    notTaken.textContent="否 · 修改或删除";
+    notTaken.onclick=()=>openAdoptedNotTakenEditor(plan,index,dose,matches[0]||null);
+    actions.append(taken,notTaken);li.append(actions);
+    const advanced=document.createElement("details"),advancedTitle=document.createElement("summary");
+    advanced.className="adopted-advanced-match";advancedTitle.textContent="高级：关联既有实际记录";
+    advanced.append(advancedTitle);
     const label=document.createElement("label"),select=document.createElement("select");
-    label.className="manual-match";label.textContent="匹配方式";
+    label.className="manual-match";label.textContent="关联方式";
     select.setAttribute("aria-label","第 "+(index+1)+" 个模型节点的匹配方式");
     for(const [v,title] of [["auto","自动匹配（最近记录）"],["manual","手动多选实际记录"],["none","不匹配此节点"]]){
       const option=document.createElement("option");option.value=v;option.textContent=title;select.append(option);
@@ -2022,7 +2306,7 @@ function renderAdoptedPoint(plan){
     const manual=plan.manualMatches||{},raw=manual[index];
     select.value=Object.hasOwn(manual,index)?raw===null?"none":"manual":"auto";
     select.addEventListener("change",()=>setManualPlanMatch(plan,index,select.value,state.candidates));
-    label.append(select);li.append(label);
+    label.append(select);advanced.append(label);
     if(select.value==="manual"){
       const details=document.createElement("details"),summary=document.createElement("summary"),options=document.createElement("div");
       details.className="match-multi-disclosure";options.className="match-multi-options";
@@ -2055,12 +2339,13 @@ function renderAdoptedPoint(plan){
       if(!shown.length){const empty=document.createElement("p");empty.className="hint";empty.textContent="目前没有可关联的新增实际服用记录。";options.append(empty)}
       const hint=document.createElement("p");hint.className="hint";
       hint.textContent="每节点最多关联 20 条；只建立关系，不复制记录，不重复计算实际服用量。";
-      details.append(options,hint);li.append(details);
+      details.append(options,hint);advanced.append(details);
     }
+    li.append(advanced);
     list.append(li);
   }
   out.append(list);
-  if(state.unmatched.length){const heading=document.createElement("strong");heading.className="scenario-replan-heading";heading.textContent="未关联的实际服用记录 · 原时间保留";out.append(heading);const unmatchedList=document.createElement("ol");unmatchedList.className="scenario-timeline";for(const row of [...state.unmatched].sort((a,b)=>a.time-b.time)){const li=document.createElement("li"),time=document.createElement("time"),amount=document.createElement("strong"),note=document.createElement("small");time.textContent=fullDate(row.time);amount.textContent=`${fmt(row.mg,3)} mg`;note.textContent="记录时间和剂量未改；反算按 48 小时窗口读取，且这条记录未替换任何原计划节点。若属于某节点，可在上方手动关联。";li.append(time,amount,note);unmatchedList.append(li)}out.append(unmatchedList)}
+  if(state.unmatched.length){const heading=document.createElement("strong");heading.className="scenario-replan-heading";heading.textContent="未关联的实际服用记录 · 原时间保留";out.append(heading);const unmatchedList=document.createElement("ol");unmatchedList.className="scenario-timeline";for(const row of [...state.unmatched].sort((a,b)=>a.time-b.time)){const li=document.createElement("li"),time=document.createElement("time"),amount=document.createElement("strong"),note=document.createElement("small");time.textContent=fullDate(row.time);amount.textContent=`${fmt(row.mg,3)} mg`;note.textContent="记录时间和剂量未改；反算按本药残留窗口读取，且这条记录未替换任何原计划节点。若属于某节点，可在上方手动关联。";li.append(time,amount,note);unmatchedList.append(li)}out.append(unmatchedList)}
   if(state.pending.length){const heading=document.createElement("strong");heading.className="scenario-replan-heading";heading.textContent=plan.adjustment?"当前已采用的调整节点 · 曲线显示":"当前已采用的原计划后续节点 · 曲线显示";out.append(heading);const pendingList=document.createElement("ol");pendingList.className="scenario-timeline";for(const dose of state.pending){const li=document.createElement("li"),time=document.createElement("time"),amount=document.createElement("strong");time.textContent=fullDate(dose.time);amount.textContent=`预计 ${fmt(dose.mg,3)} mg`;li.append(time,amount);pendingList.append(li)}out.append(pendingList)}
   if(state.replanned){const accepted=samePlanNodes(state.suggested,state.pending)&&!state.replanReason,heading=document.createElement("strong");heading.className="scenario-replan-heading";heading.textContent=accepted?"当前调整意见已采用 · 曲线已更新":"调整意见 · 尚未采用";out.append(heading);if(!accepted){const basis=document.createElement("p");basis.className="scenario-intro";basis.textContent=`依据已记录的实际时间与剂量，从 ${fullDate(state.replanFrom)} 起搜索剩余 ${state.remaining} 个节点。当前曲线仍显示已采用的后续节点。`;out.append(basis);const revised=document.createElement("ol");revised.className="scenario-timeline";for(const dose of state.suggested||[]){const li=document.createElement("li"),time=document.createElement("time"),amount=document.createElement("strong"),parts=document.createElement("small");time.textContent=fullDate(dose.time);amount.textContent=`建议模型节点 ${fmt(dose.mg,3)} mg`;parts.textContent=formatDoseContext(dose);li.append(time,amount,parts);revised.append(li)}if(state.suggested?.length)out.append(revised);else{const empty=document.createElement("p");empty.className="scenario-empty";empty.textContent=state.replanReason==="count"?"原方案节点已由记录用完，但目标时刻仍低于参考值。":state.replanReason==="time"?"按实际时间和间隔，目标时刻前已没有可用的后续节点。":state.replanReason?"当前约束与有限候选搜索下未找到调整节点。":"根据当前记录，无需保留后续假设节点。";out.append(empty)}if(!state.replanReason&&state.suggested){const proposal=document.createElement("p");proposal.className="scenario-status";proposal.textContent=`调整意见：预计剩余 ${state.suggested.length} 次 · 合计 ${fmt(state.suggestedMg,3)} mg · 目标时刻模型值约 ${fmt(state.suggestedAtTarget,3)} ${reference.unit}。实际服用记录不会因采用而改变。`;out.append(proposal);const accept=document.createElement("button");accept.type="button";accept.className="secondary adopt-adjustment";accept.textContent="采用调整意见";accept.onclick=()=>adoptPlanAdjustment(plan);out.append(accept)}}}
   const status=document.createElement("p");status.className="scenario-status";status.textContent=`按当前记录核算于 ${fullDate(state.at)} · 目标时刻血药 ${fmt(state.bloodAtTarget,3)} mg/L · 剂量等效 ${fmt(state.equivalentAtTarget,1)} mg · ${state.continuousFrom===null?"目标前存在未覆盖缺口":state.allCovered?"采样均高于参考线":`从 ${fullDate(state.continuousFrom)} 起的采样高于参考线`}${plan.cycleMin?` · 周期最低 ${fmt(state.cycleObserved,3)} ${cycleFloorUnit(plan.cycleMode)}（${state.cycleValid?"满足":"未满足"}）`:""}${plan.peakMin?` · 覆盖段峰值 ${Number.isFinite(state.peakObserved)?fmt(state.peakObserved,3):"无覆盖段"} ${cycleFloorUnit(plan.peakMode)}（${state.peakValid?"满足":"未满足"}）`:""}`;out.append(status);
@@ -2104,6 +2389,7 @@ async function renderPointInverse(){
   const out=$("pointResult"),reference=referenceSetting(),{raw:rawThreshold,value:threshold,mode,unit}=reference;
   const adopted=adoptedPlan();$("adoptedPointPanel").hidden=!adopted;
   if(adopted)renderAdoptedPoint(adopted);
+  else renderAdoptedPendingConfirm(null);
   $("pointLive").hidden=!adopted;
   pointScenario=null;minimumPointScenario=null;$("pointPreview").hidden=true;$("pointMinimumPreview").hidden=true;
   if(!rawThreshold){out.textContent="先填写一种要观察的参考值。";return}
@@ -2127,11 +2413,12 @@ async function renderPointInverse(){
   if(countText&&(!Number.isInteger(fixedCount)||fixedCount<1||fixedCount>8)){out.textContent="假设服用次数请留空，或填写 1—8 的整数。";return}
   if(peakText&&(!Number.isFinite(peakFloor)||peakFloor<=0||peakFloor>1000000)){out.textContent=`覆盖段峰值最低值须为大于 0、至多 100 万的 ${modeUnit(peakMode)} 数值。`;return}
   if(cycleText&&(!Number.isFinite(cycleMin)||cycleMin<=0||cycleMin>1000000)){out.textContent=`周期最低值须为大于 0、至多 100 万的 ${modeUnit(cycleMode)} 数值。`;return}
-  const rows=inverseRecordRows(allRows().filter(r=>r.time<=now),now);
+  const activePlans=futurePreviewNodes(drug.id).filter(r=>r.time<=target);
+  const rows=[...inverseRecordRows(allRows().filter(r=>r.time<=now),now),...activePlans.map(r=>({...r,planningOnly:true}))];
   if(cycleMin>0&&modelValue(drug,now,rows,cycleMode)<cycleMin-1e-6){
     out.textContent=`当前 ${modeUnit(cycleMode)} 模型值 ${fmt(modelValue(drug,now,rows,cycleMode),3)} 已低于设定的全周期最低 ${fmt(cycleMin,3)}；口服吸收不能立刻改变已发生的缺口，所以本约束无解。`;return
   }
-  out.textContent="正在后台计算两种单位的周期最低和覆盖段峰值约束，页面可继续操作…";
+  out.textContent=`正在后台计算；已把 ${activePlans.length} 条未来计划作为固定数学情景，并只搜索新增假设节点。计划不计实际服用。`;
   let result,minimum,comparison;
   try{
     ({result,minimum,comparison}=await solvePointInWorker({drugId:drug.id,rows,plan:plans[drug.id]||{},meals:intakes,renalState:renal,threshold,target,cap,now,fixedCount,mode,peakFloor,cycleFloor,peakRequirement,totalCap,targetWindow},requestId));
@@ -2158,15 +2445,21 @@ async function renderPointInverse(){
   if(result.reason==="totalNoSolution"){out.textContent=`在当前药盒规格、节点次数及其余条件下，搜索不到累计新增剂量不超过 ${fmt(totalCap,3)} mg 的模型方案。不会输出超出限制的方案。`;return}
   if(["cycleNoSolution","peakNoSolution","constraintNoSolution"].includes(result.reason)){out.textContent="在已有完整规格、单次上限与搜索范围内，无法同时满足参考线、整个周期最低值和覆盖段峰值要求。请核对约束与单位；不会采用不满足条件的方案。";return}
   if(result.continuousFrom===null||result.continuousFrom>=target){out.textContent="仅计计算起点前后各 48 小时的记录，当前搜索范围内无法形成持续覆盖到目标时刻的区间。口服吸收无法立刻补足已有缺口；请勿据此自行调整用药。";return}
-  pointScenario={drug:current,target,threshold,mode,cycleFloor,peakRequirement,targetWindow,...result};
-  if(minimum)minimumPointScenario={drug:current,target,threshold,mode,cycleFloor,peakRequirement,targetWindow,...minimum};
+  // Keep the exact fixed future nodes used in the solved scenario. Do not
+  // re-select from mutable cloud settings when a user clicks Adopt later.
+  const calculatedPlans=activePlans.map(item=>({id:item.id,drug:item.drug,
+    time:item.time,mg:item.mg,unit:item.unit||"mg"}));
+  pointScenario={drug:current,target,threshold,mode,cycleFloor,peakRequirement,targetWindow,
+    includedScheduledDoses:calculatedPlans,...result};
+  if(minimum)minimumPointScenario={drug:current,target,threshold,mode,cycleFloor,peakRequirement,targetWindow,
+    includedScheduledDoses:calculatedPlans,...minimum};
   const previewA=$("pointPreview"),previewB=$("pointMinimumPreview");
   previewA.hidden=!result.doses.length;previewB.hidden=!minimum?.doses.length;
   previewA.textContent="在曲线中查看方案 A";previewB.textContent="在曲线中查看方案 B";
   out.replaceChildren();out.classList.add("scenario-results");
   const label=capText?`单次假设上限 ${fmt(cap,3)} mg`:`未填写单次上限；候选仍受已存完整规格及每节点最多 8—20 单位的搜索边界限制`;
   const totalLabel=totalText?` · 当前至目标累计新增上限 ${fmt(totalCap,3)} mg`:"";
-  const intro=document.createElement("p");intro.className="scenario-intro";intro.textContent=`${drug.name} · 当前${reference.name}模型 ${fmt(result.baselineNow,3)} ${unit} · ${label}${totalLabel}${cycleMin>0?` · 全周期最低 ${fmt(cycleMin,3)} ${modeUnit(cycleMode)}`:""}${peakFloor>0?` · 覆盖段峰值最低 ${fmt(peakFloor,3)} ${modeUnit(peakMode)}`:""}。反算只读取计算起点前后各 48 小时的同药记录；更早的残留不计。各方案在同一覆盖区间比较，每 5 分钟采样验证。${futureMealNotice(drug,now,target)}`;out.append(intro);
+  const intro=document.createElement("p");intro.className="scenario-intro";intro.textContent=`已含 ${activePlans.length} 条固定计划（仅数学预测，非实际服用） · ${drug.name} · 当前${reference.name}模型 ${fmt(result.baselineNow,3)} ${unit} · ${label}${totalLabel}${cycleMin>0?` · 全周期最低 ${fmt(cycleMin,3)} ${modeUnit(cycleMode)}`:""}${peakFloor>0?` · 覆盖段峰值最低 ${fmt(peakFloor,3)} ${modeUnit(peakMode)}`:""}。反算按本药残留窗口截取历史记录；更早的数值残留不计。各方案在同一覆盖区间比较，每 5 分钟采样验证。${futureMealNotice(drug,now,target)}`;out.append(intro);
   out.append(scenarioCard({title:"方案 A · 自动补充节点",badge:fixedCount?`指定 ${fixedCount} 次`:"系统计算",result,threshold,target,description:fixedCount===2?"两次情景按 5 分钟步长比较第二个节点，并核对完整药盒单位。":"按照有限候选节点搜索得到的模型情景。",preview:previewA,adopt:()=>adoptPointScenario("A"),reference}));
   if(minimum){
     const aSwing=comparison?.a?.swing,bSwing=comparison?.newModel?.swing;
@@ -2188,7 +2481,8 @@ function adoptPointScenario(variant){
   const selected=variant==="B"?minimumPointScenario:pointScenario;
   if(!selected||selected.drug!==current||!selected.doses?.length)return;
   const now=Date.now(),plan={v:1,variant,drug:current,adoptedAt:now,target:selected.target,threshold:selected.threshold,mode:selected.mode,cap:$("pointMaxDose").value.trim(),totalMax:Number($("pointTotalMax").value)||0,count:$("pointCount").value.trim(),peakMin:Number($("pointPeakMin").value)||0,peakMode:$("pointPeakMode").value,cycleMin:Number($("pointCycleMin").value)||0,cycleMode:$("pointCycleMode").value,targetLimitEnabled:$("pointTargetLimitEnabled").checked,
-    targetTolerance:$("pointTargetLimitEnabled").checked?Number(selected.targetWindow?.value??0):0,baselineIds:records.filter(r=>r.drug===current).map(r=>r.id),doses:structuredClone(selected.doses),manualMatches:{},mealSignature:mealScenarioSignature(current,now,selected.target)};
+    targetTolerance:$("pointTargetLimitEnabled").checked?Number(selected.targetWindow?.value??0):0,baselineIds:records.filter(r=>r.drug===current).map(r=>r.id),doses:structuredClone(selected.doses),
+    includedScheduledDoses:structuredClone(selected.includedScheduledDoses||[]),manualMatches:{},mealSignature:mealScenarioSignature(current,now,selected.target)};
   inverseMemory[current]={...(inverseMemory[current]||{}),adoptedPointPlan:plan};persist();appliedPointScenario=null;renderPointInverse();drawChart();
 }
 let inverseWorker=null,inverseRequestId=0,inverseInputTimer=null;
@@ -2226,8 +2520,9 @@ async function renderInverse(){
   if(!Number.isFinite(start)){out.textContent="请选择希望开始连续高于参考线的时间。";return}
   if(start<now-60000){out.textContent="目标开始时间已过去；请选择当前或未来时间。";return}
   if(!Number.isFinite(hours)||hours<0.25||hours>24){out.textContent="连续维持时长请输入 0.25—24 小时。";return}
-  const d=chosen(),rows=inverseRecordRows(allRows().filter(r=>r.time<=now),start);
-  out.textContent="正在后台计算持续时长情景，页面可继续操作…";
+  const d=chosen(),activePlans=futurePreviewNodes(d.id).filter(r=>r.time<=start+hours*3600000),
+    rows=[...inverseRecordRows(allRows().filter(r=>r.time<=now),start),...activePlans.map(r=>({...r,planningOnly:true}))];
+  out.textContent=`正在后台计算持续时长情景；已纳入 ${activePlans.length} 条既有计划，且未当作真实已服用。`;
   let result,display;
   try{
     ({result,display}=await solveDurationInWorker({drugId:d.id,rows,plan:plans[d.id]||{},meals:intakes,renalState:renal,threshold,start,hours,now,mode,countText:$("inverseCount").value.trim()},requestId));
@@ -2245,7 +2540,7 @@ async function renderInverse(){
   inverseScenario={drug:current,target:start+hours*3600000,threshold,mode,doses:result.doses};$("inversePreview").hidden=false;
   const end=start+hours*3600000;
   out.replaceChildren();out.classList.add("scenario-results");
-  out.append(scenarioCard({title:"持续时长模型情景",badge:`${result.count} 个节点`,result:display,threshold,target:end,description:`${fullDate(start)} 至 ${fullDate(end)}，每 5 分钟采样检查${reference.name}。反算只读取目标开始时刻前后各 48 小时的同药记录；更早的残留不计。${futureMealNotice(d,now,end)}`,coverageLabel:"指定时段内的采样均达到参考线",reference,reminderKind:"duration"}));
+  out.append(scenarioCard({title:"持续时长模型情景",badge:`${result.count} 个节点`,result:display,threshold,target:end,description:`已含 ${activePlans.length} 条固定未来计划（非实际服用）。${fullDate(start)} 至 ${fullDate(end)}，每 5 分钟采样检查${reference.name}。反算按本药有效残留窗口读取历史记录；更早的残留不计。${futureMealNotice(d,now,end)}`,coverageLabel:"指定时段内的采样均达到参考线",reference,reminderKind:"duration"}));
   const note=document.createElement("p");note.className="scenario-caution";note.textContent=`${warning}48 小时外残留已排除；清除较慢时结果可能偏低。仅搜索已存完整单位与有限候选时刻；这是数学情景，不是服药时间或剂量建议。`;out.append(note);
 }
 /* Distinct curve, reference, and target colours. */
@@ -2304,13 +2599,18 @@ function drawChart(){
   const activeScenario=appliedPointScenario?.drug===current?appliedPointScenario:adopted?(()=>{const state=currentAdoptedEvaluation(adopted);return{drug:current,target:adopted.target,threshold:adopted.threshold,mode:adopted.mode,doses:state.pending,adoptedVariant:adopted.variant||"A"}})():null;
   const manual=activeScenario?null:getScenario(),multi=activeScenario?.doses||null;
   const scenario=multi?{time:multi[0]?.time??activeScenario.target,mg:0,doses:multi}:manual,scenarioTime=scenario&&!scenario.invalid?scenario.time:null;
-  const previewRows=scenario&&!scenario.invalid?(scenario.doses||[{time:scenario.time,mg:scenario.mg}]):[];
+  const separatePreview=scenario&&!scenario.invalid?(scenario.doses||[{time:scenario.time,mg:scenario.mg}]):[];
+  const previewRows=adopted
+    ? [...separatePreview,...adoptedIncludedScheduledDoses(adopted,rows,separatePreview)]
+       .filter((item,index,array)=>!array.slice(0,index).some(other=>
+         Math.abs(other.time-item.time)<=60000&&Math.abs(other.mg-item.mg)<.0001))
+    : futurePreviewNodes(current,separatePreview);
   const now=Date.now(),start=dayStart(selectedDate),end=start+48*3600000;
   const scale=Number($("chartScale").value)||55;
   const W=Math.min(16000,Math.max(mobile?360:760,wrap.clientWidth||0,Math.ceil((end-start)/3600000*scale)+L+R));
   svg.setAttribute("viewBox",`0 0 ${W} ${H}`);svg.style.width=`${W}px`;svg.style.height=`${H}px`;
   const reference=referenceSetting(),threshold=reference.value,referenceEquivalent=reference.mode==="equivalent";
-  const count=Math.min(600,Math.max(288,Math.ceil(W/5))),points=[],modelRows=rows.filter(r=>r.time>=start-30*effectiveHalfLife(d)*3600000&&r.time<=end);
+  const count=Math.min(600,Math.max(288,Math.ceil(W/5))),points=[],modelRows=rows.filter(r=>r.time>=start-residualWindowHours(d)*3600000&&r.time<=end);
   const times=Array.from({length:count+1},(_,i)=>Math.round(start+(end-start)*i/count));
   const allMeals=intakes.filter(m=>m.kind==="meal"&&m.time>=start-3*86400000&&m.time<=end+86400000);
   const validRemoteInputs=modelRows.length<=300&&previewRows.length<=30&&allMeals.length<=160&&
@@ -2343,7 +2643,7 @@ function drawChart(){
   const foodEffectPoint=recordedMealRows.length&&dayEffectPoints.length?dayEffectPoints.reduce((a,b)=>Math.abs(b.c-b.unfed)>Math.abs(a.c-a.unfed)?b:a):null;
   let scenarioPeak=0;
   const scenarioContribution=(t,includeFood=true)=>previewRows.reduce((sum,row)=>sum+singleConcentration(d,row.mg,(t-row.time)/3600000,row.time,includeFood),0);
-  if(scenario&&!scenario.invalid)for(const p of points)scenarioPeak=Math.max(scenarioPeak,p.c+scenarioContribution(p.t));
+  if(previewRows.length)for(const p of points)scenarioPeak=Math.max(scenarioPeak,p.c+scenarioContribution(p.t));
   const maxY=Math.max(.001,peak.c*1.23,hasFoodEffect?unfedPeak.unfed*1.23:0,scenarioPeak*1.2,!referenceEquivalent&&threshold!==null&&Number.isFinite(threshold)&&threshold>0?threshold*1.13:0);
   const maxEq=Math.max(1,...points.map(p=>Math.max(p.eq,p.eqPreview||0)),referenceEquivalent&&threshold!==null&&Number.isFinite(threshold)&&threshold>0?threshold:0)*1.18;
   const x=t=>L+(t-start)/(end-start)*(W-L-R),y=c=>H-B-c/maxY*(H-T-B),yEq=amount=>H-B-amount/maxEq*(H-T-B);
@@ -2386,10 +2686,10 @@ function drawChart(){
     const slot=level<0?lastLabelX.indexOf(Math.min(...lastLabelX)):level;
     lastLabelX[slot]=xx;
     const label=svgEl("text",{x:Math.min(W-R-5,Math.max(L+5,xx+4)),y:H-B+36+slot*15,fill:color,"font-size":mobile?9:10});
-    label.textContent=`${dose.preview?"预计 ":dose.matched?"已匹配 ":""}${dateText(dose.time)} · ${fmt(dose.mg,3)} mg`;
+    label.textContent=`${dose.preview?(scheduledDoses.some(d=>d.id===dose.id)?"计划 ":"情景 "):dose.matched?"已匹配 ":""}${dateText(dose.time)} · ${fmt(dose.mg,3)} mg`;
     svg.append(label);
   }
-  if(rows.length||scenario&&!scenario.invalid){
+  if(points.length){
     if(hasFoodEffect){const unfedPath=points.map((p,i)=>`${i?"L":"M"}${x(p.t).toFixed(2)} ${y(p.unfed).toFixed(2)}`).join(" ");svg.append(svgEl("path",{d:unfedPath,fill:"none",stroke:CHART_COLORS.unfed,"stroke-width":2,"stroke-dasharray":"6 5","stroke-linejoin":"round"}))}
     const path=points.map((p,i)=>`${i?"L":"M"}${x(p.t).toFixed(2)} ${y(p.c).toFixed(2)}`).join(" ");
     svg.append(svgEl("path",{d:`${path} L${x(end)} ${y(0)} L${x(start)} ${y(0)} Z`,fill:"url(#curveFill)"}));
@@ -2398,7 +2698,7 @@ function drawChart(){
     svg.append(svgEl("path",{d:equivalentPath,fill:"none",stroke:CHART_COLORS.equivalent,"stroke-width":2.5,"stroke-linejoin":"round","stroke-linecap":"round"}));
     if(foodEffectPoint&&Math.abs(foodEffectPoint.c-foodEffectPoint.unfed)>.001){const xx=x(foodEffectPoint.t);svg.append(svgEl("line",{x1:xx,y1:y(foodEffectPoint.c),x2:xx,y2:y(foodEffectPoint.unfed),stroke:"#f6cd83","stroke-width":2.5}));for(const value of [foodEffectPoint.c,foodEffectPoint.unfed])svg.append(svgEl("circle",{cx:xx,cy:y(value),r:4,fill:"#f6cd83",stroke:"#1b1c20","stroke-width":1.5}))}
     rows.filter(r=>r.time>=start&&r.time<=end).forEach(r=>svg.append(svgEl("circle",{cx:x(r.time),cy:y(0),r:3.5,fill:CHART_COLORS.blood})));
-    if(scenario&&!scenario.invalid){
+    if(previewRows.length){
       const preview=points.map((p,i)=>`${i?"L":"M"}${x(p.t).toFixed(2)} ${y(p.bloodPreview??p.c+scenarioContribution(p.t)).toFixed(2)}`).join(" ");
       svg.append(svgEl("path",{d:preview,fill:"none",stroke:CHART_COLORS.previewBlood,"stroke-width":2.2,"stroke-dasharray":"5 5","stroke-linejoin":"round"}));
       if(previewFoodEffect){const withoutPreviewFood=points.map((p,i)=>`${i?"L":"M"}${x(p.t).toFixed(2)} ${y(p.c+scenarioContribution(p.t,false)).toFixed(2)}`).join(" ");svg.append(svgEl("path",{d:withoutPreviewFood,fill:"none",stroke:CHART_COLORS.unfed,"stroke-width":1.6,"stroke-dasharray":"2 5","stroke-linejoin":"round"}))}
@@ -2892,6 +3192,31 @@ function initAppMode(){
 }
 /* Device-scoped login sessions. UI exposes no raw cookies or passwords. */
 const REMEMBERED_DEVICE_KEY="pk-atlas-remembered-device-v1";
+const DEVICE_INSTALL_KEY="pk-atlas-random-installation-v1";
+async function browserDeviceMetadata(){
+  // Purpose-limited, resettable random installation ID; NOT browser fingerprint.
+  let deviceId="";
+  try{
+    deviceId=localStorage.getItem(DEVICE_INSTALL_KEY)||"";
+    if(!/^[a-zA-Z0-9_-]{16,100}$/.test(deviceId)){
+      deviceId=crypto.randomUUID();
+      localStorage.setItem(DEVICE_INSTALL_KEY,deviceId);
+    }
+  }catch{/* Storage disabled: legacy independent sessions remain supported. */}
+  const hints=navigator.userAgentData;
+  let osVersion="版本未提供";
+  try{
+    if(hints?.getHighEntropyValues){
+      const value=await hints.getHighEntropyValues(["platformVersion"]);
+      if(value.platformVersion)osVersion=value.platformVersion;
+    }
+  }catch{/* Browser privacy policy may hide precise OS versions. */}
+  const platform=String(hints?.platform||navigator.platform||"未知系统").slice(0,30);
+  const browser=String(hints?.brands?.find(x=>!x.brand.toLowerCase().includes("not"))?.brand||"网页浏览器").slice(0,24);
+  return {deviceId,devicePlatform:platform,deviceOS:osVersion,
+          deviceName:(platform+" · "+browser).slice(0,50)};
+}
+
 function appRememberSession(result){
   if(!result?.username)return;
   try{
@@ -2936,8 +3261,12 @@ async function loadDeviceSessions(){
       item.className="device-session";
       name.textContent=session.name+(session.current?" · 当前设备":"");
       const expires=session.expiresAt?displaySessionTime(session.expiresAt):"未知";
-      meta.textContent="最近使用："+displaySessionTime(session.lastActiveAt)+
-        " · 预计到期："+expires+(session.remembered?" · 保持登录":"");
+      const method=session.loginMethod==="ios-native"?"iOS 原生 App · 网页授权":
+        session.loginMethod==="web"?"网页账号登录":"历史未知";
+      meta.textContent=(session.platform||"未知系统")+" · "+(session.osVersion||"版本未提供")+
+        " · "+method+" · 最近使用："+displaySessionTime(session.lastActiveAt)+
+        " · 预计到期："+expires+(session.remembered?" · 保持登录":"")+
+        (!session.identifiedInstallation?" · 旧会话未提供设备标识，无法安全去重":"");
       action.type="button";
       action.className=session.current?"record-danger":"ghost";
       action.textContent=session.current?"退出当前设备":"退出此设备";
@@ -3014,7 +3343,7 @@ let appOfflineRestored=false;
 function initOfflineShell(){
   if(location.protocol!=="https:"||!("serviceWorker" in navigator))return;
   const install=()=>navigator.serviceWorker.register(
-    "/sw.js?v=server-math-20261117b",{scope:"/"}
+    "/sw.js?v=devices-20261117a",{scope:"/"}
   ).catch(()=>{/* A failed shell install must not block login or autosave. */});
   if(document.readyState==="complete")void install();
   else window.addEventListener("load",install,{once:true});
@@ -3063,16 +3392,17 @@ async function offlineRestoreLastVerified(){
   authUser=item.username;
   applyAccountState(item.state,item.version);
   const entries=syncReadDrafts(item.username);
-  let proposed=structuredClone(baseState);
-  for(const entry of entries){
-    proposed=mergeState(entry.draft.base,entry.draft.state,proposed);
-    if(!proposed){
-      syncConflict=true;
-      break;
-    }
+  const pending=entries.filter(entry=>syncDraftChanges(entry.draft.base,entry.draft.state).length);
+  // In offline mode, recover exactly the latest local pending snapshot.
+  // Never silently union deleted rows back in from older tabs/devices.
+  const newest=pending.at(-1);
+  if(newest){
+    syncApplyMerged(newest.draft.state);
+    syncUploadId=newest.draft.operationId||syncNewOperationId();
   }
-  if(!syncConflict)syncApplyMerged(proposed);
-  syncPending=entries.length>0;
+  syncRecoveredDrafts=entries;
+  syncConflict=false;
+  syncPending=Boolean(newest);
   $("accountName").textContent=item.username+" · 离线模式";
   $("authForm").hidden=true;
   $("accountActions").hidden=false;
@@ -3090,7 +3420,7 @@ async function offlineRestoreLastVerified(){
 function render(){
   if(!document.body.classList.contains("stage-calc")){if(document.body.classList.contains("stage-choose"))renderChooser();return}
   $("calcContext").textContent=`${selectedDate} · ${chosen().name}`;
-  renderDay();renderRecords();renderIntakes();renderMealImpact();
+  renderDay();renderRecords();renderScheduledDoses();renderIntakes();renderMealImpact();
   if(!matchMedia("(max-width:700px)").matches||document.body.dataset.mobilePane==="results"){drawChart();renderScenario();if(inversePage==="point")renderPointInverse();else renderInverse()}
   renderHistory();renderAppHome();renderAppHistoryQuicklist();updateWheelTriggers();
 }
@@ -3098,15 +3428,15 @@ function fillNow(){const now=new Date(),clock=now.getHours()*3600000+now.getMinu
 function fillIntakeNow(){const now=new Date(),clock=now.getHours()*3600000+now.getMinutes()*60000;$("intakeTime").value=localInput(selectedDate===dateKey(now.getTime())?now.getTime():dayStart(selectedDate)+clock);updateWheelTriggers()}
 function resetIntakeEdit(){editingIntakeId="";$("intakeSubmit").textContent="＋ 保存饮食记录";$("intakeCancel").hidden=true;$("intakeDelete").hidden=true;$("intakeKind").value="meal";$("mealType").value="regular";$("intakeDrink").value="none";$("intakeNote").value="";$("mealTypeWrap").hidden=false;fillIntakeNow()}
 function editIntake(id){const x=intakes.find(row=>row.id===id);if(!x)return;editingIntakeId=id;$("intakeKind").value=x.kind;$("intakeTime").value=localInput(x.time);$("mealType").value=x.mealType;$("intakeDrink").value=x.drink;$("intakeNote").value=x.note;$("mealTypeWrap").hidden=x.kind!=="meal";$("intakeSubmit").textContent="保存饮食记录修改";$("intakeCancel").hidden=false;$("intakeDelete").hidden=false;updateWheelTriggers();if(document.body.classList.contains("app-mode"))appOpenSheet("intake",{editing:true});else{setMobilePane("records");$("intakeForm").scrollIntoView({behavior:"smooth",block:"center"})}}
-function resetDoseEdit(){editingDoseId="";$("doseSubmit").innerHTML="<span>＋</span> 保存这次服用";$("doseCancel").hidden=true;$("doseDelete").hidden=true;setDoseEditor(unitByDrug[current]||"mg",chosen().defaultDose);fillNow()}
+function resetDoseEdit(){editingDoseId="";editingScheduledId="";editingAdoptedIndex=null;editingAdoptedAdjustmentIndex=null;$("doseCancel").hidden=true;$("doseDelete").hidden=true;setDoseEditor(unitByDrug[current]||"mg",chosen().defaultDose);fillNow();doseSaveHint()}
 function editRecord(id){
   const r=records.find(x=>x.id===id);if(!r)return;
   if(!DRUGS.some(d=>d.id===r.drug))return;
   if(current!==r.drug){current=r.drug;$("drug").value=current;$("calcDrug").value=current;renderDrug()}
-  selectedDate=dateKey(r.time);selectedDateFollowsToday=selectedDate===dateKey(Date.now());editingDoseId=id;
+  selectedDate=dateKey(r.time);selectedDateFollowsToday=selectedDate===dateKey(Date.now());editingScheduledId="";editingAdoptedIndex=null;editingAdoptedAdjustmentIndex=null;editingDoseId=id;
   $("doseTime").value=localInput(r.time);timeTouched=true;
   setDoseEditor(r.unit==="g"?"g":"mg",r.mg);
-  $("doseSubmit").textContent="保存这次服用修改";$("doseCancel").hidden=false;$("doseDelete").hidden=false;
+  doseSaveHint();$("doseCancel").hidden=false;$("doseDelete").hidden=false;
   if(document.body.classList.contains("app-mode"))appOpenSheet("dose",{editing:true});else{setMobilePane("records");$("doseForm").scrollIntoView({behavior:"smooth",block:"center"})}
 }
 let pendingDoseDeleteId=null,pendingIntakeDeleteId=null;
@@ -3261,11 +3591,26 @@ function init(){
     renal={crcl,source:renalEstimatedPending?"estimated":"entered"};renalEstimatedPending=false;MODEL_PARAMS.clear();appliedPointScenario=null;persist();renderDrug();
   });
   $("renalReset").addEventListener("click",()=>{renal=null;renalEstimatedPending=false;MODEL_PARAMS.clear();appliedPointScenario=null;persist();renderDrug()});
-  $("doseTime").addEventListener("input",()=>{timeTouched=true});$("nowButton").addEventListener("click",()=>{$("doseTime").value=localInput(Date.now());timeTouched=true;updateWheelTriggers()});
+  $("doseTime").addEventListener("input",()=>{timeTouched=true;doseSaveHint()});$("nowButton").addEventListener("click",()=>{$("doseTime").value=localInput(Date.now());timeTouched=true;updateWheelTriggers()});
   $("doseAmount").addEventListener("input",renderPillHint);
   $("doseUnit").addEventListener("change",()=>{const mg=Number($("doseAmount").value)*(previousUnit==="g"?1000:1),unit=$("doseUnit").value;unitByDrug[current]=unit;setDoseEditor(unit,mg)});
   $("doseCancel").addEventListener("click",resetDoseEdit);
-  $("doseDelete").addEventListener("click",()=>{if(editingDoseId)requestDoseDeletion(editingDoseId)});
+  $("doseDelete").addEventListener("click",()=>{
+    if(editingAdoptedAdjustmentIndex!==null){const index=editingAdoptedAdjustmentIndex;
+      if(confirm("删除已采用的调整节点？不删除实际服用记录。")){
+        resetDoseEdit();deleteAdoptedAdjustmentNodeFromEditor(index);
+        if(document.body.classList.contains("app-mode"))appCloseSheet();}
+      return;
+    }
+    if(editingAdoptedIndex!==null){const index=editingAdoptedIndex;
+      if(confirm("删除该已采用方案的计划节点？不会删除实际服用记录或其他独立计划。")){
+        resetDoseEdit();deleteAdoptedNodeFromEditor(index);if(document.body.classList.contains("app-mode"))appCloseSheet();}
+      return;
+    }
+    if(editingDoseId)requestDoseDeletion(editingDoseId);
+    else if(editingScheduledId){const id=editingScheduledId;
+      if(confirm("删除这条计划服用？")){scheduledDoses=scheduledDoses.filter(d=>d.id!==id);resetDoseEdit();persist();renderDrug()}}
+  });
   $("deleteDoseCancel").addEventListener("click",()=>$("deleteDoseDialog").close("cancel"));
   $("deleteDoseConfirm").addEventListener("click",()=>$("deleteDoseDialog").close("delete"));
   $("deleteDoseDialog").addEventListener("close",()=>{
@@ -3281,8 +3626,31 @@ function init(){
     if(!Number.isFinite(time)||!Number.isFinite(mg)||mg<=0){alert("请输入大于 0 的有效单次剂量和服用时间。");return}
     if(current==="prep_ftc_taf"&&Math.abs(mg/225-Math.round(mg/225))>1e-8){alert("当前收录的是 FTC 200 mg + TAF 25 mg 固定复方；请按整片输入 225 mg 的倍数。");return}
     const courseId=`day-${dateKey(time)}`;
-    if(editingDoseId){const r=records.find(x=>x.id===editingDoseId);if(r){Object.assign(r,{time,mg,unit,courseId});if(r.source==="ios-journal-17.1")r.journal={...r.journal,editedOnSite:true}}}
-    else records.push({id:uuid(),courseId,drug:current,time,mg,unit});
+    if(editingAdoptedAdjustmentIndex!==null){
+      const index=editingAdoptedAdjustmentIndex;
+      if(updateAdoptedAdjustmentNodeFromEditor(index,time,mg)){
+        resetDoseEdit();if(document.body.classList.contains("app-mode"))appCloseSheet();
+      }
+      return;
+    }
+    if(editingAdoptedIndex!==null){
+      const index=editingAdoptedIndex;
+      if(updateAdoptedNodeFromEditor(index,time,mg)){
+        resetDoseEdit();if(document.body.classList.contains("app-mode"))appCloseSheet();
+      }
+      return;
+    }
+    const isPlan=!!editingScheduledId||time>Date.now();
+    if(isPlan){
+      const id=editingScheduledId||editingDoseId||uuid();
+      if(editingDoseId)records=records.filter(x=>x.id!==editingDoseId);
+      const value={id,drug:current,time,mg,unit,kind:"planned"};
+      const index=scheduledDoses.findIndex(x=>x.id===id);
+      if(index<0)scheduledDoses.push(value);else scheduledDoses[index]=value;
+    }else if(editingDoseId){
+      const r=records.find(x=>x.id===editingDoseId);
+      if(r){Object.assign(r,{time,mg,unit,courseId});if(r.source==="ios-journal-17.1")r.journal={...r.journal,editedOnSite:true}}
+    }else records.push({id:uuid(),courseId,drug:current,time,mg,unit});
     selectedDate=dateKey(time);selectedDateFollowsToday=selectedDate===dateKey(Date.now());appliedPointScenario=null;syncClearEditorFields(["doseTime","doseAmount","doseUnit"]);persist();resetDoseEdit();renderDrug();if(document.body.classList.contains("app-mode"))appCloseSheet();
   });
   $("intakeKind").addEventListener("change",()=>{$("mealTypeWrap").hidden=$("intakeKind").value!=="meal"});

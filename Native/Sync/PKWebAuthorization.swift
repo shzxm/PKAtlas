@@ -26,11 +26,7 @@ struct PKWebAuthRequest {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-        guard let origin = PKBackendConfiguration.baseURL else {
-            throw PKHTTPError(status: 0, message: "尚未配置云同步服务器，请在「我的」里填写自己的 HTTPS 站点。")
-        }
-        var url = URLComponents(url: origin.appendingPathComponent("api/native/login"),
-                                resolvingAgainstBaseURL: false)!
+        var url = URLComponents(string: "https://pk.example.com/api/native/login")!
         url.queryItems = [
             URLQueryItem(name: "challenge", value: challenge),
             URLQueryItem(name: "state", value: state)
@@ -40,7 +36,7 @@ struct PKWebAuthRequest {
     }
 
     func checkCallback(_ callback: URL) throws -> String {
-        guard callback.scheme == "pkatlasopen",
+        guard callback.scheme == "pkatlas",
               callback.host == "auth",
               callback.path == "/callback",
               let items = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems,
@@ -58,7 +54,7 @@ struct PKWebAuthRequest {
 /// Store only the opaque session token. Passwords stay on the browser-hosted
 /// website, and the callback contains a two-minute, PKCE-bound one-time code.
 enum PKSessionVault {
-    private static let service = "org.pkatlas.open.nativeSession.v1"
+    private static let service = "com.example.PKAtlas.nativeSession.v1"
 
     private static func query() -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,

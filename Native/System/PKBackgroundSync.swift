@@ -4,7 +4,7 @@ import BackgroundTasks
 /// Opportunistic background reconciliation, not a replacement for APNs and
 /// never a promise of delivery at a specific time. iOS owns the schedule.
 enum PKBackgroundSync {
-    static let identifier = "org.pkatlas.open.refresh"
+    static let identifier = "com.example.PKAtlas.refresh"
 
     static func register() {
         BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in

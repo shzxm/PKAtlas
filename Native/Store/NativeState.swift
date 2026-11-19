@@ -31,6 +31,13 @@ indirect enum PKJSON: Codable, Equatable {
     var string: String? { if case .string(let v) = self { return v }; return nil }
     var number: Double? { if case .number(let v) = self { return v }; return nil }
     var object: [String: PKJSON]? { if case .object(let v) = self { return v }; return nil }
+    var array: [PKJSON]? { if case .array(let values) = self { return values }; return nil }
+    var arrayStringValues: [String]? {
+        if case .array(let values) = self { return values.compactMap(\.string) }
+        if case .string(let value) = self { return [value] }
+        return nil
+    }
+
 }
 
 struct PKCloudState: Codable, Equatable {
@@ -61,8 +68,55 @@ struct PKCloudState: Codable, Equatable {
                           time: Date(timeIntervalSince1970: ms / 1000),
                           courseId: raw["courseId"]?.string,
                           unit: raw["unit"]?.string ?? "mg",
-                          isImported: (raw["source"]?.string == "ios-journal-17.1"))
+                          isImported: (["ios-journal-17.1", "healthkit-read"].contains(raw["source"]?.string ?? "")))
         }
+    }
+
+    /// Future plans are separate from actual records and retain their plan
+    /// status even after their intended time has passed. They never enter
+    /// the baseline pharmacokinetic model until explicitly marked taken.
+    var scheduledDoses: [PKDose] {
+        guard case .array(let items)? = settings["scheduledDoses"] else { return [] }
+        return items.compactMap { item in
+            guard let row = item.object,
+                  let id = row["id"]?.string, !id.isEmpty,
+                  let drug = row["drug"]?.string,
+                  let mg = row["mg"]?.number, mg.isFinite, mg > 0, mg < 100_000,
+                  let when = row["time"]?.number, when.isFinite else { return nil }
+            return PKDose(id: id, drug: drug, mg: mg,
+                time: Date(timeIntervalSince1970: when / 1000),
+                unit: row["unit"]?.string ?? "mg")
+        }
+    }
+    mutating func saveScheduledDose(_ dose: PKDose) {
+        var items = settings["scheduledDoses"]?.array ?? []
+        let original = items.first(where: { $0.object?["id"]?.string == dose.id })?.object ?? [:]
+        var item = original
+        item["id"] = .string(dose.id)
+        item["drug"] = .string(dose.drug)
+        item["mg"] = .number(dose.mg)
+        item["time"] = .number(dose.time.timeIntervalSince1970 * 1000)
+        item["unit"] = .string(dose.unit)
+        item["kind"] = .string("planned")
+        if let index = items.firstIndex(where: { $0.object?["id"]?.string == dose.id }) {
+            items[index] = .object(item)
+        } else { items.append(.object(item)) }
+        settings["scheduledDoses"] = .array(items)
+    }
+    mutating func deleteScheduledDose(_ id: String) {
+        var items = settings["scheduledDoses"]?.array ?? []
+        items.removeAll { $0.object?["id"]?.string == id }
+        settings["scheduledDoses"] = .array(items)
+    }
+    /// Explicit confirmation is the sole transition from a mathematical
+    /// plan to a taken dose. The same stable ID is used to prevent duplicates.
+    mutating func confirmScheduledDose(_ id: String, at now: Date = .now) -> Bool {
+        guard let dose = scheduledDoses.first(where: { $0.id == id }),
+              dose.time <= now,
+              !records.contains(where: { $0["id"]?.string == id }) else { return false }
+        saveDose(dose)
+        deleteScheduledDose(id)
+        return true
     }
 
     var meals: [PKIntake] {
@@ -133,7 +187,7 @@ enum PKDataError: LocalizedError {
 }
 
 struct PKSecureDisk {
-    private static let service = "org.pkatlas.open.encryption.v1"
+    private static let service = "com.example.PKAtlas.encryption.v1"
 
     private static func key() throws -> SymmetricKey {
         let query: [String: Any] = [

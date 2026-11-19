@@ -22,18 +22,22 @@ targets:
     type: application
     platform: iOS
     sources:
-      # No WebKit or WKWebView in the iOS target. Legacy sources remain
-      # available in the repository only for historical reference.
+      # Navigation remains native. A single bundled, offline-only SVG chart
+      # component reproduces the website plot; it never opens a remote page.
       - path: Sources/PKAtlasApp.swift
       - path: Native
       - path: Resources/Assets.xcassets
       - path: Resources/Model/drug-catalog.json
         buildPhase: resources
+      - path: Resources/Model/health-medication-aliases.json
+        buildPhase: resources
       - path: Resources/Model/engine-compat.json
         buildPhase: resources
-      - path: Resources/Model/github-release-public-key.txt
+      - path: Resources/Model/engine-signing-public-key.txt
         buildPhase: resources
       - path: Resources/Model/site-engine.js
+        buildPhase: resources
+      - path: Resources/Chart/website-chart.html
         buildPhase: resources
       - path: Resources/PrivacyInfo.xcprivacy
         buildPhase: resources
@@ -43,10 +47,10 @@ targets:
         CFBundleDisplayName: 药时
         CFBundleURLTypes:
           - CFBundleURLName: org.pkatlas.app.open
-            CFBundleURLSchemes: [pkatlasopen]
+            CFBundleURLSchemes: [pkatlas]
         CFBundleName: PKAtlas
-        CFBundleShortVersionString: "2.7"
-        CFBundleVersion: "11"
+        CFBundleShortVersionString: "2.24"
+        CFBundleVersion: "30"
         LSRequiresIPhoneOS: true
         UIApplicationSupportsDocumentBrowser: false
         UIApplicationSceneManifest:
@@ -55,7 +59,7 @@ targets:
           - remote-notification
           - fetch
         BGTaskSchedulerPermittedIdentifiers:
-          - org.pkatlas.open.refresh
+          - com.example.PKAtlas.refresh
         NSHealthShareUsageDescription: "经您授权后读取 Apple 健康已登记的药物，用于对照药时本机记录。"
         NSHealthUpdateUsageDescription: "药时不会向 Apple 健康写入用药事件；本功能仅申请读取权限。"
         UISupportedInterfaceOrientations:
@@ -71,22 +75,22 @@ targets:
           - arm64
         UILaunchScreen:
           UIColorName: LaunchBackground
-        UIUserInterfaceStyle: Dark
         ITSAppUsesNonExemptEncryption: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.pkatlas.open
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.PKAtlas
         CODE_SIGN_ENTITLEMENTS: 'Resources/PKAtlas-$(CONFIGURATION).entitlements'
         PRODUCT_NAME: PKAtlas
         INFOPLIST_FILE: Resources/Info.plist
         SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Resources/PKAtlas-Bridging-Header.h
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: ""
         CODE_SIGNING_ALLOWED: YES
         ENABLE_APP_SANDBOX: YES
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: YES
-        MARKETING_VERSION: "2.7"
-        CURRENT_PROJECT_VERSION: "11"
+        MARKETING_VERSION: "2.24"
+        CURRENT_PROJECT_VERSION: "30"
         SDKROOT: iphoneos
     scheme:
       testTargets:
@@ -103,7 +107,7 @@ targets:
       - target: PKAtlas
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.pkatlas.openUITests
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.PKAtlasUITests
         GENERATE_INFOPLIST_FILE: YES
         TEST_TARGET_NAME: PKAtlas
         SWIFT_VERSION: "5.0"
@@ -118,7 +122,7 @@ targets:
       - target: PKAtlas
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.pkatlas.openNativeTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.PKAtlasNativeTests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "5.0"
         CODE_SIGNING_ALLOWED: NO

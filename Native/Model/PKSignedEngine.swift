@@ -70,16 +70,15 @@ enum PKSignedEngine {
     }
 
     static var publicKeyData: Data? {
-        // Generic open-source builds do not trust any private developer's
-        // engine key. A user configures their own signing public key if they
-        // explicitly opt into a custom backend.
-        let hex = PKBackendConfiguration.trustedKeyHex
+        guard let file = Bundle.main.url(forResource: "engine-signing-public-key", withExtension: "txt"),
+              let str = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+        let hex = str.trimmingCharacters(in: .whitespacesAndNewlines)
         guard hex.count == 64 else { return nil }
         var bytes = [UInt8]()
-        for offset in stride(from: 0, to: 64, by: 2) {
-            let first = hex.index(hex.startIndex, offsetBy: offset)
-            let last = hex.index(first, offsetBy: 2)
-            guard let value = UInt8(hex[first..<last], radix: 16) else { return nil }
+        for index in stride(from: 0, to: hex.count, by: 2) {
+            let a = hex.index(hex.startIndex, offsetBy: index)
+            let b = hex.index(a, offsetBy: 2)
+            guard let value = UInt8(hex[a..<b], radix: 16) else { return nil }
             bytes.append(value)
         }
         return Data(bytes)
@@ -140,7 +139,16 @@ enum PKSignedEngine {
               data.count < maxEnvelopeBytes,
               let envelope = try? JSONDecoder().decode(PKSignedEngineEnvelope.self, from: data)
         else { return nil }
-        return try? verify(envelope, bundled: bundled)
+        // A correct signature is not enough: a previously signed but malformed
+        // executable bundle must not be restored merely because its metadata
+        // matches. Restore the previous verified revision if smoke test fails.
+        do {
+            let verified = try verify(envelope, bundled: bundled)
+            try smokeTest(verified)
+            return verified
+        } catch {
+            return nil
+        }
     }
 
     static func restored(bundled: PKCatalog) -> PKVerifiedSignedEngine? {

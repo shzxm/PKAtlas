@@ -3,8 +3,8 @@ import Charts
 import UIKit
 
 private enum AtlasStyle {
-    static let background = Color(red: 0.035, green: 0.055, blue: 0.095)
-    static let accent = Color(red: 0.39, green: 0.80, blue: 0.99)
+    static let background = PKSystemPalette.background
+    static let accent = PKSystemPalette.accent
     static let warm = Color(red: 0.99, green: 0.78, blue: 0.50)
     static let mint = Color(red: 0.44, green: 0.86, blue: 0.74)
 }
@@ -18,61 +18,115 @@ struct NativeRootView: View {
     @StateObject private var reminders = NativeReminderScheduler.shared
     @Environment(\.scenePhase) private var scenePhase
     @State private var showGlobalDose = false
+    @State private var showGlobalMeal = false
+    @State private var showGlobalChoice = false
 
     @ToolbarContentBuilder
     private var globalAdd: some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) {
             Button {
-                showGlobalDose = true
+                showGlobalChoice = true
             } label: {
-                Label("记录服用", systemImage: "plus.circle.fill")
+                Label("新增记录", systemImage: "plus.circle.fill")
             }
             .accessibilityIdentifier("native.global.add.dose")
         }
     }
 
     var body: some View {
-        TabView {
-            Tab("今天", systemImage: "house.fill") {
+        TabView(selection: $store.activeTab) {
+            Tab("今天", systemImage: "house.fill", value: .today) {
                 NavigationStack { TodayNativeView().toolbar { globalAdd } }
             }
-            Tab("曲线", systemImage: "waveform.path.ecg") {
+            Tab("曲线", systemImage: "waveform.path.ecg", value: .chart) {
                 NavigationStack { ChartNativeView().toolbar { globalAdd } }
             }
-            Tab("反算", systemImage: "function") {
+            Tab("反算", systemImage: "function", value: .inverse) {
                 NavigationStack { InverseNativeView().toolbar { globalAdd } }
             }
-            Tab("历史", systemImage: "clock.arrow.circlepath") {
+            Tab("历史", systemImage: "clock.arrow.circlepath", value: .history) {
                 NavigationStack { HistoryNativeView().toolbar { globalAdd } }
             }
-            Tab("我的", systemImage: "person.crop.circle") {
+            Tab("我的", systemImage: "person.crop.circle", value: .settings) {
                 NavigationStack { SettingsNativeView().toolbar { globalAdd } }
             }
         }
         .tint(AtlasStyle.accent)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !store.healthAutoNotice.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "heart.text.square.fill")
+                    Text(store.healthAutoNotice)
+                        .font(.caption.weight(.semibold))
+                    Spacer(minLength: 0)
+                    Button("知道了", systemImage: "xmark.circle") {
+                        store.clearHealthAutoNotice()
+                    }
+                    .labelStyle(.iconOnly)
+                    .accessibilityIdentifier("native.health.notice.dismiss")
+                }
+                .padding(10)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 12)
+                .accessibilityIdentifier("native.health.auto-notice")
+            }
+        }
         .sheet(isPresented: $showGlobalDose) { DoseEditorNativeView() }
+        .sheet(isPresented: $showGlobalMeal) { MealEditorNativeView() }
+        .confirmationDialog("新增哪种实际记录？", isPresented: $showGlobalChoice,
+                            titleVisibility: .visible) {
+            Button("记录已经服用的药物", systemImage: "pills.fill") {
+                showGlobalDose = true
+            }
+            .accessibilityIdentifier("native.global.choice.dose")
+            Button("记录用餐或饮品", systemImage: "fork.knife") {
+                showGlobalMeal = true
+            }
+            .accessibilityIdentifier("native.global.choice.meal")
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("这里只登记已发生的实际事件，不会直接采用数学模型的假设节点。")
+        }
         .environmentObject(store)
         .environmentObject(reminders)
-        .preferredColorScheme(.dark)
+        // Follow the operating system; never force night mode.
+        // UI always renders the saved snapshot synchronously. Network checks,
+        // including HealthKit, never gate the tab bar or its charts.
         .task { await store.start() }
+        .task { await PKHealthMedications.shared.refreshAutomatically() }
         .task { await store.refreshModel(force: true) }
         .task { await store.checkNativeRelease(force: false) }
+        .onChange(of: store.accessState) { _, access in
+            if access == .verified {
+                store.reconcileAutomaticHealthEvents(PKHealthMedications.shared.matches)
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 PKBackgroundSync.schedule()
                 Task { await store.refreshModel() }
                 Task { await store.checkNativeRelease() }
+                Task { await PKHealthMedications.shared.refreshAutomatically() }
                 Task {
-                    await store.refresh()
-                    await reminders.refresh()
+                    // Validate the session in the background with a cooldown.
+                    // Never lock or erase cached pages for an offline failure.
+                    await store.start()
+                    if store.accessState == .verified {
+                        await store.refresh()
+                        await store.refreshAdoptedReview()
+                        await reminders.refresh()
+                    }
                 }
             }
         }
         .alert("发现药时 App 新版本", isPresented: $store.showingReleaseUpdatePrompt) {
+            if let url = store.latestRelease?.privateReleaseURL {
+                Button("查看 GitHub 私有 Release") { UIApplication.shared.open(url) }
+            }
             Button("稍后更新", role: .cancel) {}
         } message: {
             if let release = store.latestRelease {
-                Text("最新版本 \(release.displayVersion)；当前为 \(store.installedReleaseDescription)。\n\n\(release.releaseNotes)\n\n请到 GitHub Releases 下载 \(release.fileName)，验证 SHA-256 后使用自己的签名方式安装。App 不会自行下载安装包或访问私人版本服务器。")
+                Text("最新版本 \(release.displayVersion)；当前为 \(store.installedReleaseDescription)。\n\n\(release.releaseNotes)\n\n私有 GitHub Release 可能以 ZIP 提供原始 IPA。解压后须使用自己的签名方式安装。你也可以在 iCloud 云盘「下载」中找到原始 IPA；App 不会自动下载安装。")
             }
         }
         .alert("需要更新药时 App", isPresented: $store.showingModelUpgradePrompt) {
@@ -117,15 +171,18 @@ struct MetricTile: View {
         VStack(alignment: .leading, spacing: 9) {
             Text(label).font(.caption).foregroundStyle(.secondary)
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(amount).font(.system(size: 27, weight: .semibold, design: .rounded))
+                Text(amount).font(.system(size: 25, weight: .semibold, design: .rounded))
                     .monospacedDigit()
-                    .minimumScaleFactor(0.65)
-                Text(unit).font(.caption2).foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.42)
+                    .layoutPriority(1)
+                Text(unit).font(.system(size: 10)).foregroundStyle(.secondary)
+                    .lineLimit(1).minimumScaleFactor(0.8)
             }
             Rectangle().fill(tint).frame(height: 3).clipShape(Capsule())
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 88, alignment: .leading)
+        .padding(10)
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
     }
 }
@@ -150,6 +207,7 @@ struct TodayNativeView: View {
     @EnvironmentObject var store: NativeAppStore
     @State private var addDose = false
     @State private var addMeal = false
+    @State private var quickTemplate: PKDose?
 
     private var recent: [PKDose] {
         store.doses.filter { Calendar.current.isDateInToday($0.time) }
@@ -165,19 +223,32 @@ struct TodayNativeView: View {
                             .foregroundStyle(AtlasStyle.mint)
                         Text("药时").font(.largeTitle.bold())
                         Spacer()
-                        Text("本地计算").font(.caption.bold())
-                            .padding(8).glassEffect(.regular, in: Capsule())
+                        Menu {
+                            ForEach(store.catalog.drugs) { drug in
+                                Button(drug.name) { store.switchDrug(drug.id) }
+                            }
+                        } label: {
+                            VStack(alignment: .trailing, spacing: 3) {
+                                Text(store.selectedDrug?.name ?? "选择药物")
+                                    .font(.title2.bold())
+                                    .foregroundStyle(AtlasStyle.warm)
+                                    .multilineTextAlignment(.trailing)
+                                Label("切换当前药物", systemImage: "chevron.down")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            .lineLimit(2)
+                        }
+                        .accessibilityIdentifier("native.today.drug.right")
                     }
                     ModelNotice()
                 }
-                DrugNativePicker()
-                    .padding(.horizontal, 5)
 
                 if let drug = store.selectedDrug {
                     if drug.canCalculate {
                         let blood = store.model.concentration(drug, at: .now)
                         let equivalent = store.model.equivalent(drug, at: .now)
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 154), spacing: 12)], spacing: 12) {
+                        LazyVGrid(columns: [GridItem(.flexible(minimum: 0), spacing: 8),
+                                            GridItem(.flexible(minimum: 0), spacing: 8)], spacing: 8) {
                             MetricTile(label: "当前模型浓度",
                                        amount: blood.isFinite ? blood.formatted(.number.precision(.fractionLength(2))) : "不可用",
                                        unit: "mg/L", tint: AtlasStyle.warm)
@@ -216,6 +287,69 @@ struct TodayNativeView: View {
                     }
                 }
 
+                if store.adoptedPlanObject() != nil {
+                    GlassPanel {
+                        HStack {
+                            Label("已采用模型 · 下一个预计节点", systemImage: "clock.badge.checkmark")
+                                .font(.headline)
+                            Spacer()
+                            Text("方案 \(store.adoptedPlanObject()?["variant"]?.string ?? "A")")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let review = store.adoptedReview {
+                            let unmatched = store.unmatchedAdoptedNodes()
+                            if let upcoming = unmatched.first {
+                                Text(upcoming.time,
+                                     format: .dateTime.month().day().weekday().hour().minute())
+                                    .font(.title2.bold()).monospacedDigit()
+                                    .foregroundStyle(AtlasStyle.mint)
+                                    .accessibilityIdentifier("native.today.next-node.time")
+                                Text(upcoming.overdue ?
+                                     "已过时但未匹配的原计划节点：\(upcoming.mg.formatted(.number.precision(.fractionLength(0...2)))) mg" :
+                                     "最早未匹配原计划节点：\(upcoming.mg.formatted(.number.precision(.fractionLength(0...2)))) mg")
+                                    .font(.callout).foregroundStyle(.secondary)
+                            } else {
+                                Text("已采用方案全部节点都已匹配实际记录")
+                                    .font(.subheadline.bold()).foregroundStyle(.mint)
+                            }
+                            Text("已匹配 \(review.matchedNodeCount) 个 · 尚未匹配 \(unmatched.count) 个（含过去节点）")
+                                .font(.caption).foregroundStyle(.secondary)
+                            if unmatched.isEmpty {
+                                Label("当前不存在未匹配的原计划节点", systemImage: "checkmark.circle")
+                                    .font(.caption).foregroundStyle(.mint)
+                            } else {
+                                ForEach(unmatched) { node in
+                                    Divider().opacity(0.22)
+                                    HStack(spacing: 9) {
+                                        Image(systemName: node.overdue ? "clock.badge.exclamationmark" : "clock")
+                                            .foregroundStyle(node.overdue ? .orange : .cyan)
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text("节点 \(node.index + 1) · \(node.time.formatted(date: .abbreviated, time: .shortened))")
+                                                .font(.subheadline.bold())
+                                            Text(node.overdue ? "已过计划时间 · 尚无匹配实际记录" : "预计执行节点 · 尚无匹配实际记录")
+                                                .font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Text("\(node.mg.formatted(.number.precision(.fractionLength(0...2)))) mg")
+                                            .font(.subheadline.bold()).monospacedDigit()
+                                    }
+                                    .accessibilityIdentifier("native.today.unmatched.node.\(node.index)")
+                                }
+                            }
+                            Text("以上均为原数学方案的未匹配节点，不表示已经服用；即使时间已过也不隐藏，不会自动生成服用记录。")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        } else {
+                            ProgressView("正在按照网页版规则匹配所有原计划节点…")
+                        }
+                        Button {
+                            store.activeTab = .inverse
+                        } label: {
+                            Label("查看节点匹配和即时调整意见", systemImage: "arrow.right")
+                        }
+                        .buttonStyle(.glass)
+                    }
+                }
+
                 GlassPanel {
                     HStack {
                         Text("今天的记录").font(.headline)
@@ -243,6 +377,39 @@ struct TodayNativeView: View {
                             }
                             if dose.id != recent.prefix(8).last?.id { Divider().opacity(0.35) }
                         }
+                    }
+                }
+
+                let templates = PKDoseEntryGuard.recentTemplates(in: store.doses)
+                if !templates.isEmpty {
+                    GlassPanel {
+                        HStack {
+                            Label("快速记录 · 沿用历史填写", systemImage: "arrow.uturn.backward.circle")
+                                .font(.headline)
+                            Spacer()
+                            Text("仅用于已实际服用")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        ForEach(templates) { dose in
+                            Button {
+                                quickTemplate = dose
+                            } label: {
+                                HStack(spacing: 9) {
+                                    Image(systemName: "square.and.pencil")
+                                    Text(store.catalog.drugs.first(where: { $0.id == dose.drug })?.name ?? dose.drug)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text("\(dose.mg.formatted()) mg")
+                                        .monospacedDigit()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("native.today.quick-template.\(dose.drug)")
+                        }
+                        Text("只预填上一次实际记录的药物与剂量，时间自动设为现在；不会自动新增，也不代表建议再次服用。")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
 
@@ -277,6 +444,7 @@ struct TodayNativeView: View {
         .background(AtlasStyle.background)
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $addDose) { DoseEditorNativeView() }
+        .sheet(item: $quickTemplate) { item in DoseEditorNativeView(template: item) }
         .sheet(isPresented: $addMeal) { MealEditorNativeView() }
     }
 }
@@ -285,11 +453,19 @@ struct DoseEditorNativeView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var store: NativeAppStore
     var existing: PKDose?
+    var template: PKDose? = nil
+    var scheduledExisting: PKDose? = nil
+    /// Editing an adopted mathematical node, not a taken dose record.
+    var adoptedNodeIndex: Int? = nil
+    var adoptedAdjustmentIndex: Int? = nil
 
     @State private var drugID = ""
     @State private var amount = ""
     @State private var when = Date.now
     @State private var confirmDelete = false
+    @State private var possibleDuplicate: PKDose?
+    @State private var showingPossibleDuplicate = false
+    @State private var validationProblem: String?
 
     private var number: Double? {
         guard let parsed = Double(amount.replacingOccurrences(of: ",", with: ".")),
@@ -297,15 +473,52 @@ struct DoseEditorNativeView: View {
         return parsed
     }
 
+    private var isPlan: Bool {
+        adoptedNodeIndex != nil || adoptedAdjustmentIndex != nil ||
+        scheduledExisting != nil || PKDoseEntryGuard.isPlanned(when)
+    }
+    private func commitRecord(allowDuplicate: Bool = false) {
+        guard let mg = number, !drugID.isEmpty else { return }
+        let candidate = PKDose(id: existing?.id ?? scheduledExisting?.id ?? UUID().uuidString,
+            drug: drugID, mg: mg, time: when,
+            courseId: existing?.courseId,
+            unit: "mg", isImported: existing?.isImported ?? false)
+        if !allowDuplicate,
+           !isPlan,
+           let duplicate = PKDoseEntryGuard.possibleDuplicate(candidate, in: store.doses) {
+            possibleDuplicate = duplicate
+            showingPossibleDuplicate = true
+            return
+        }
+        if let adoptedAdjustmentIndex {
+            guard store.updateAdoptedAdjustmentNode(index: adoptedAdjustmentIndex,
+                                                     mg: mg, time: when) else {
+                validationProblem = "已采用调整节点已发生变更，请重新核对。"
+                return
+            }
+        } else if let adoptedNodeIndex {
+            guard store.updateAdoptedNode(index: adoptedNodeIndex, mg: mg, time: when) else {
+                validationProblem = "已采用计划节点已在其他设备更新，请重新进入页面核对。"
+                return
+            }
+        } else if isPlan {
+            store.savePlannedDose(candidate, replacingActual: existing?.id)
+        } else {
+            store.editDose(candidate)
+        }
+        dismiss()
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("已服用的记录") {
+                Section(isPlan ? "计划服用 · 尚未发生" : "已服用的记录") {
                     Picker("药物", selection: $drugID) {
                         ForEach(store.catalog.drugs) { d in
                             Text(d.name).tag(d.id)
                         }
                     }
+                    .disabled(adoptedNodeIndex != nil || adoptedAdjustmentIndex != nil)
                     HStack {
                         Text("剂量")
                         TextField("毫克", text: $amount)
@@ -314,37 +527,43 @@ struct DoseEditorNativeView: View {
                             .accessibilityIdentifier("native.dose.amount")
                         Text("mg").foregroundStyle(.secondary)
                     }
-                    DatePicker("服用时间", selection: $when,
+                    DatePicker(isPlan ? "计划时间" : "服用时间", selection: $when,
                                displayedComponents: [.date, .hourAndMinute])
+                    if isPlan {
+                        Label((adoptedNodeIndex != nil || adoptedAdjustmentIndex != nil) ? "正在修改已采用数学情景节点；不会创建实际服药记录。" : "未来时间将保存为计划，不计入实际已服用浓度。预测曲线会叠加该节点，只有完成确认才能记为实际服用。", systemImage: "calendar.badge.clock")
+                            .font(.footnote).foregroundStyle(.orange)
+                            .accessibilityIdentifier("native.dose.future-notice")
+                    }
+                    if existing == nil,
+                       let last = PKDoseEntryGuard.mostRecentActual(drugID: drugID, in: store.doses) {
+                        Button {
+                            amount = last.mg.formatted()
+                        } label: {
+                            Label("填入本药上次实际记录的剂量 · \(last.mg.formatted()) mg",
+                                  systemImage: "clock.arrow.circlepath")
+                        }
+                        .accessibilityIdentifier("native.dose.use-last")
+                    }
                 }
                 Section {
-                    Text("仅填写已经实际服用的剂量，不依据模型建议服药。")
+                    Text(isPlan ? "这是一条数学计划，不会自动变成实际服药，也不会自动创建服药提醒。" : "当前时间保存为实际已服用记录；未来时间仅作为计划情景。模型不构成服药建议。")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-                if existing != nil {
+                if existing != nil || scheduledExisting != nil || adoptedNodeIndex != nil || adoptedAdjustmentIndex != nil {
                     Section {
-                        Button("删除该记录", role: .destructive) { confirmDelete = true }
+                        Button((adoptedNodeIndex != nil || adoptedAdjustmentIndex != nil) ? "删除该已采用计划节点" : isPlan ? "删除该计划" : "删除该记录", role: .destructive) { confirmDelete = true }
                     }
                 }
             }
             .nativeKeyboardDismissal()
-            .navigationTitle(existing == nil ? "记录服药" : "编辑服药")
+            .navigationTitle((adoptedNodeIndex != nil || adoptedAdjustmentIndex != nil) ? "修改已采用计划节点" : scheduledExisting != nil ? "编辑计划服用" : existing != nil ? "编辑服药" : isPlan ? "新增计划服用" : "记录服药")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
-                        if let mg = number {
-                            store.editDose(PKDose(id: existing?.id ?? UUID().uuidString,
-                                                  drug: drugID, mg: mg, time: when,
-                                                  courseId: existing?.courseId,
-                                                  unit: "mg",
-                                                  isImported: existing?.isImported ?? false))
-                            dismiss()
-                        }
-                    }
+                    Button(isPlan ? "保存计划" : "保存实际记录") { commitRecord() }
                     .disabled(number == nil || drugID.isEmpty)
                     .accessibilityIdentifier("native.dose.save")
                 }
@@ -352,15 +571,36 @@ struct DoseEditorNativeView: View {
             .confirmationDialog("确定删除这条服药记录？", isPresented: $confirmDelete) {
                 Button("确认删除", role: .destructive) {
                     if let existing { store.removeDose(existing.id) }
+                    if let scheduledExisting { store.removePlannedDose(scheduledExisting.id) }
+                    if let adoptedNodeIndex { _ = store.deleteAdoptedNode(index: adoptedNodeIndex) }
+                    if let adoptedAdjustmentIndex {
+                        _ = store.deleteAdoptedAdjustmentNode(index: adoptedAdjustmentIndex)
+                    }
                     dismiss()
                 }
             } message: {
-                Text("删除会影响本机计算并同步到云端，不可撤销。")
+                Text("删除会影响本机计算并同步到云端，请先核对。")
+            }
+            .confirmationDialog("发现可能重复的实际服用记录", isPresented: $showingPossibleDuplicate) {
+                Button("仍然保存这条记录") { commitRecord(allowDuplicate: true) }
+                Button("返回检查", role: .cancel) {}
+            } message: {
+                if let match = possibleDuplicate {
+                    Text("已有相同药物、相同剂量且时间相差不超过 5 分钟的记录：\(match.mg.formatted()) mg · \(match.time.formatted(date: .abbreviated, time: .shortened))。如果确实分两次服用，可以继续保存。")
+                }
+            }
+            .alert("请核对记录时间", isPresented: Binding(
+                get: { validationProblem != nil },
+                set: { if !$0 { validationProblem = nil } }
+            )) {
+                Button("返回修改", role: .cancel) { validationProblem = nil }
+            } message: {
+                Text(validationProblem ?? "")
             }
             .onAppear {
-                drugID = existing?.drug ?? store.selectedDrug?.id ?? "pregabalin"
-                amount = (existing?.mg ?? store.selectedDrug?.defaultDose ?? 0).formatted()
-                when = existing?.time ?? .now
+                drugID = scheduledExisting?.drug ?? existing?.drug ?? template?.drug ?? store.selectedDrug?.id ?? "pregabalin"
+                amount = scheduledExisting?.mg.formatted() ?? existing?.mg.formatted() ?? template?.mg.formatted() ?? ""
+                when = scheduledExisting?.time ?? existing?.time ?? .now
             }
         }
         .presentationDetents([.large])

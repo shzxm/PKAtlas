@@ -47,6 +47,25 @@ final class PKStateCompatibilityTests: XCTestCase {
         XCTAssertNil(PKMerge.rows(base: [original], local: [], remote: [remote]))
     }
 
+    func testFullSnapshotLastUploadRequestHasNoDeviceIdentity() throws {
+        var state = PKCloudState()
+        state.saveDose(PKDose(drug: "pregabalin", mg: 50,
+            time: Date(timeIntervalSince1970: 1_700_000_000)))
+        let data = try JSONEncoder().encode(PKLastUploadRequest(
+            version: 2, state: state,
+            operationId: "123e4567-e89b-12d3-a456-426614174000"))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["syncPolicy"] as? String, "last-upload-wins-v1")
+        XCTAssertEqual(json["version"] as? Int, 2)
+        XCTAssertEqual(json["operationId"] as? String, "123e4567-e89b-12d3-a456-426614174000")
+        let payload = try XCTUnwrap(json["state"] as? [String: Any])
+        for key in ["records", "courses", "intakes", "plans", "settings"] {
+            XCTAssertNotNil(payload[key])
+        }
+        XCTAssertNil(json["deviceId"])
+        XCTAssertNil(json["clientTimestamp"])
+    }
+
     func testEncryptedDiskRoundTrip() throws {
         let username = "pkatlas_fixture_" + UUID().uuidString.lowercased()
         var state = PKCloudState()

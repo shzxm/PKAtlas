@@ -13,7 +13,7 @@ struct PKAtlasApp: App {
         WindowGroup {
             NativeRootView()
                 .onOpenURL { url in
-                    guard url.scheme == "pkatlasopen", url.host == "open" else { return }
+                    guard url.scheme == "pkatlas", url.host == "open" else { return }
                 }
         }
     }

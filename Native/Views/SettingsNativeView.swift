@@ -1,5 +1,6 @@
 import SwiftUI
 import AuthenticationServices
+import UIKit
 
 struct SettingsNativeView: View {
     @EnvironmentObject private var store: NativeAppStore
@@ -9,25 +10,11 @@ struct SettingsNativeView: View {
     @State private var exportURL: URL?
     @State private var showConflictConfirmation = false
     @State private var showingLogout = false
-    @State private var currentSessions: [AccountSession] = []
-    @State private var loadingSessions = false
     @StateObject private var remotePush = PKRemotePushManager.shared
     @StateObject private var healthMedications = PKHealthMedications.shared
     @State private var showHealthImportConfirmation = false
     @State private var healthImportResult = ""
-    @State private var serverURLText = PKBackendConfiguration.baseURL?.absoluteString ?? ""
-    @State private var serverSigningKey = PKBackendConfiguration.trustedKeyHex
-    @State private var serverSetupStatus = "未配置时所有服药记录仅保存在本机"
-
-    struct AccountSession: Decodable, Identifiable {
-        var id: String
-        var name: String
-        var current: Bool
-        var remembered: Bool
-        var expiresAt: Double
-    }
-    struct SessionList: Decodable { let sessions: [AccountSession] }
-    struct RevokeResponse: Decodable { let ok: Bool; let revoked: Int }
+    @State private var diagnosticsCopied = false
 
     var body: some View {
         Form {
@@ -54,40 +41,6 @@ struct SettingsNativeView: View {
                 }
             } header: { Text("数据与账号") }
 
-            Section("可选云同步 · 私人服务器") {
-                TextField("https://your-server.example", text: $serverURLText)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                    .accessibilityIdentifier("native.server.origin")
-                SecureField("可选：服务器引擎验签公钥（64位十六进制）", text: $serverSigningKey)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Button("保存配置并重新核对模型") {
-                    guard !store.isLoggedIn else {
-                        serverSetupStatus = "请先退出当前云端账号再更换服务器。"
-                        return
-                    }
-                    guard PKBackendConfiguration.validatedOrigin(serverURLText) != nil ||
-                          serverURLText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                        serverSetupStatus = "服务器必须是 HTTPS 域名，不支持裸 IP、端口或带凭据的 URL。"
-                        return
-                    }
-                    guard PKBackendConfiguration.setTrustedKeyHex(serverSigningKey),
-                          PKBackendConfiguration.configure(serverURLText) else {
-                        serverSetupStatus = "服务器公钥应为 64 位十六进制。"
-                        return
-                    }
-                    serverSetupStatus = PKBackendConfiguration.baseURL == nil ?
-                        "已关闭云同步，保持离线本机模式" : "已保存服务器；仅在你手动配置后才与此域名通信"
-                    Task { await store.refreshModel(force: true) }
-                }
-                .disabled(store.isLoggedIn)
-                Text(serverSetupStatus).font(.caption).foregroundStyle(.secondary)
-                Text("公开 IPA 不含开发者私人服务器。若配置自己掌控的 HTTPS 站点，将把登录会话及选定的同步数据传送到该站点；公开 App 无法保证你自行选择的服务器不会记录 IP。")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-
             if !store.isLoggedIn {
                 Section("通过官方网站登录") {
                     Button {
@@ -99,9 +52,9 @@ struct SettingsNativeView: View {
                             if authorizingInBrowser { ProgressView() }
                         }
                     }
-                    .disabled(authorizingInBrowser || store.busy || PKBackendConfiguration.baseURL == nil)
+                    .disabled(authorizingInBrowser || store.busy)
                     .accessibilityIdentifier("native.auth.browser")
-                    Text("只有手动填写自己的 HTTPS 云端服务器后，才能使用网页登录。账号密码由所选服务器处理，不会发送到 GitHub。")
+                    Text("将打开 pk.example.com 的安全网页完成登录。原生 App 不接触账号密码；网站只会返回绑定此次设备请求的一次性授权码，并在 HTTPS 下换取登录会话。")
                         .font(.footnote).foregroundStyle(.secondary)
                     Text("首次授权后下载当前云端记录，并尝试安全恢复本机草稿。匿名草稿不会擅自上传。")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -109,7 +62,10 @@ struct SettingsNativeView: View {
             } else {
                 Section("云端同步") {
                     Button {
-                        Task { await store.refresh() }
+                        Task {
+                            if store.accessState == .verified { await store.refresh() }
+                            else { await store.start(force: true) }
+                        }
                     } label: {
                         Label("立即核对云端", systemImage: "arrow.triangle.2.circlepath")
                     }
@@ -126,25 +82,12 @@ struct SettingsNativeView: View {
                             showConflictConfirmation = true
                         }
                     }
-                    Button {
-                        Task { await fetchSessions() }
+                    NavigationLink {
+                        DeviceSessionsNativeView()
                     } label: {
                         Label("管理已登录设备", systemImage: "person.2.badge.gearshape")
                     }
-                    if loadingSessions { ProgressView() }
-                    ForEach(currentSessions) { device in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(device.name)
-                                Text(device.current ? "当前设备" : (device.remembered ? "个人设备" : "临时会话"))
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if device.current {
-                                Image(systemName: "checkmark.circle").foregroundStyle(.mint)
-                            }
-                        }
-                    }
+                    .accessibilityIdentifier("native.settings.devices")
                     Button("退出登录", role: .destructive) { showingLogout = true }
                 }
             }
@@ -172,7 +115,7 @@ struct SettingsNativeView: View {
                     .font(.footnote).foregroundStyle(.secondary)
             }
 
-            Section("GitHub Releases · 版本更新") {
+            Section("App 版本更新 · 匿名校验") {
                 HStack {
                     Label("已安装版本", systemImage: "iphone")
                     Spacer()
@@ -181,27 +124,29 @@ struct SettingsNativeView: View {
                 }
                 if let latest = store.latestRelease {
                     HStack {
-                        Label("GitHub 最新版", systemImage: "checkmark.shield")
+                        Label("服务器最新版", systemImage: "checkmark.shield")
                         Spacer()
                         Text(latest.displayVersion).foregroundStyle(.secondary).monospacedDigit()
                     }
                     if store.releaseAvailable {
-                        Label("GitHub 发布了新版本", systemImage: "arrow.up.circle.fill")
+                        Label("发现可安装的新版本", systemImage: "arrow.up.circle.fill")
                             .foregroundStyle(.orange)
                         Text(latest.releaseNotes).font(.footnote)
-                        Text("GitHub Release 资产：" + latest.fileName)
+                        Text("未签名 IPA：" + latest.fileName)
                             .font(.caption.monospaced()).textSelection(.enabled)
+                        if let url = latest.privateReleaseURL {
+                            Link(destination: url) {
+                                Label("打开 GitHub 私有 Release（需要仓库访问权限）",
+                                      systemImage: "arrow.up.right.square")
+                            }
+                            .accessibilityIdentifier("native.release.github")
+                            Text("GitHub 网页可能提供 ZIP 压缩包。解压后取得原始 IPA，自行签名安装并按发布页 SHA-256 验证；不会自动安装。")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
                         Button {
                             UIPasteboard.general.string = latest.fileName
                         } label: {
                             Label("复制未签名 IPA 文件名", systemImage: "doc.on.doc")
-                        }
-                        if let url = URL(string: "https://github.com/shzxm/PKAtlas/releases/latest") {
-                            Button {
-                                UIApplication.shared.open(url)
-                            } label: {
-                                Label("打开 GitHub Releases", systemImage: "arrow.up.right.square")
-                            }
                         }
                     }
                 }
@@ -216,14 +161,14 @@ struct SettingsNativeView: View {
                     Task { await store.checkNativeRelease(force: true) }
                 } label: {
                     HStack {
-                        Label("通过 GitHub 检查最新版本", systemImage: "arrow.clockwise")
+                        Label("立即匿名检查最新版本", systemImage: "arrow.clockwise")
                         if store.releaseChecking { Spacer(); ProgressView() }
                     }
                 }
                 .disabled(store.releaseChecking)
                 .accessibilityIdentifier("native.release.check")
                 Toggle("启动及回到前台自动检查版本", isOn: $store.automaticReleaseChecks)
-                Text("版本检查仅请求 GitHub Releases 官方 API。不会发送药物记录、账号 Cookie、HealthKit 数据或个人服务器域名；GitHub 会看到网络出口 IP，必要时使用 VPN。关闭自动检查后仅手动请求。")
+                Text("版本检测使用独立 HTTPS 会话，不发送登录 Cookie、账号、药物数据、设备编号或推送令牌。181 服务器为本接口关闭访问日志，不向第三方查询，也不自动下载安装 IPA。网络出口 IP 仍可能被 Cloudflare 看见；若要对 Cloudflare 隐藏真实 IP，请自行使用可信 VPN/代理。关闭自动检查后，仅按按钮时联网。")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -261,71 +206,97 @@ struct SettingsNativeView: View {
             }
 
             Section("Apple 健康 · 用药记录") {
-                Button {
-                    Task { await healthMedications.requestAndRead() }
+                NavigationLink {
+                    AppleHealthNativeView()
                 } label: {
-                    Label("授权读取 Apple 健康已登记药物", systemImage: "heart.text.square")
+                    HStack {
+                        Label("Apple 健康 · 读取、匹配、调整与选择", systemImage: "heart.text.square")
+                        Spacer()
+                        Text("\(healthMedications.matches.count) 条")
+                            .foregroundStyle(.secondary).font(.caption)
+                    }
                 }
-                Text(healthMedications.status)
-                    .font(.footnote).foregroundStyle(.secondary)
-                if healthMedications.reviewing { ProgressView("正在读取 Apple 健康…") }
-                Text("自行签名的 IPA 必须实际授予 HealthKit 签名权限；仅在 Xcode 的 entitlements 文件中声明并不代表安装包拥有权限。若点击后闪退，请导出 PKAtlas .ips 崩溃日志以确认是否为签名、授权或系统调用问题。")
+                .accessibilityIdentifier("native.health.open-review")
+                Text("独立管理读取事件、手动匹配药物、调整剂量和时间、逐条勾选导入。人工映射随账户云端同步；不会直接写回 Apple 健康。")
                     .font(.caption2).foregroundStyle(.secondary)
-                if let lastStage = UserDefaults.standard.string(forKey: "PKHealthLastReadStage"),
-                   lastStage != "complete" {
-                    Text("最近读取阶段：" + lastStage)
-                        .font(.caption2).foregroundStyle(.orange)
+            }
+
+            Section("数据体检 · 本机自检") {
+                let report = PKDataHealth.inspect(store.snapshot, catalog: store.catalog)
+                let unreviewed = report.issues.reduce(0) { total, issue in
+                    total + PKDataReview.rows(for: issue.id, snapshot: store.snapshot,
+                        catalog: store.catalog).filter { !store.isAuditConfirmed($0.fingerprint) }.count
                 }
-                Button {
-                    healthMedications.openHealthApp()
-                } label: {
-                    Label("打开 Apple 健康，手动登记服药", systemImage: "arrow.up.forward.app")
+                HStack {
+                    Label(unreviewed > 0 ? "发现需人工核对的数据" :
+                          (report.hasProblems ? "异常已人工核对" : "数据结构检查通过"),
+                          systemImage: unreviewed > 0 ? "exclamationmark.triangle" : "checkmark.shield")
+                        .foregroundStyle(unreviewed > 0 ? .orange : .mint)
+                        .font(.headline)
+                    Spacer()
+                    Text(unreviewed > 0 ? "\(unreviewed) 条待核对" : (report.hasProblems ? "已确认" : "正常"))
+                        .font(.caption.bold())
                 }
-                Text("Apple 健康没有公开的指定药物填写页跳转或预填接口。此按钮仅尝试打开健康 App；若系统不支持，请手动进入「浏览 → 用药」。")
+                .accessibilityIdentifier("native.diagnostics.summary")
+                Text("已检查 \(report.recordCount) 条服药原始记录和 \(report.mealCount) 条饮食原始记录。检测只在本机进行，不上传药物名称、剂量或诊断内容。")
                     .font(.footnote).foregroundStyle(.secondary)
-                if !healthMedications.matches.isEmpty {
-                    let possible = healthMedications.matches.filter { $0.drugID != nil && $0.mg != nil }
-                    Text("最近 120 天已读取 \(healthMedications.matches.count) 条已服事件，其中 \(possible.count) 条药物名称及 mg 剂量可匹配。")
-                        .font(.subheadline)
-                    ForEach(healthMedications.matches.prefix(40)) { entry in
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack {
-                                Text(entry.medicationName).font(.subheadline.bold())
-                                Spacer()
-                                if let drugID = entry.drugID, entry.mg != nil {
-                                    Text("匹配 \(store.catalog.drugs.first(where: { $0.id == drugID })?.name ?? drugID)")
-                                        .font(.caption).foregroundStyle(.mint)
-                                } else {
-                                    Text("待人工核对").font(.caption).foregroundStyle(.orange)
-                                }
-                            }
-                            Text("\(entry.time.formatted(date: .abbreviated, time: .shortened)) · 健康记录 \(entry.quantityText)")
-                                .font(.caption).foregroundStyle(.secondary)
-                            if entry.mg == nil {
-                                Text("剂量是片数、体积或未提供，不能直接按 mg 导入。")
-                                    .font(.caption2).foregroundStyle(.orange)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                    Button {
-                        showHealthImportConfirmation = true
-                    } label: {
-                        Label("核对并导入可匹配的记录到药时", systemImage: "square.and.arrow.down")
-                    }
-                    .disabled(possible.isEmpty)
-                    Text("导入后仅写入药时本机记录及已登录账号的云端同步，不会反向写入 Apple 健康。重复事件和现有同药同剂量的近时记录自动关联，不重复新建。")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                if !healthImportResult.isEmpty {
-                    Text(healthImportResult).font(.footnote).foregroundStyle(.mint)
-                }
-                if healthMedications.matches.isEmpty && !healthMedications.approvedMedications.isEmpty {
-                    Text("未读到已服事件，或当前授权的药物尚无对应记录。已授权药物：" + healthMedications.approvedMedications.joined(separator: "、"))
+                if let saved = store.lastLocalSavedAt {
+                    Label("本机加密快照已保存：" + saved.formatted(date: .abbreviated, time: .shortened),
+                          systemImage: "externaldrive.badge.checkmark")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Label("当前尚无已保存的本机快照", systemImage: "externaldrive")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("HealthKit 不允许第三方写入 Apple 健康的实际服药事件，且不应把未服用或模型假设节点当作已服。")
-                    .font(.footnote).foregroundStyle(.secondary)
+                Label(store.hasPendingChanges ? "存在尚未回读确认的云端修改" : "目前无待同步更改",
+                      systemImage: store.hasPendingChanges ? "icloud.and.arrow.up" : "checkmark.icloud")
+                    .font(.caption)
+                    .foregroundStyle(store.hasPendingChanges ? .orange : .secondary)
+                NavigationLink {
+                    PKDataReviewNativeView()
+                } label: {
+                    Label("打开逐条核对清单", systemImage: "checklist")
+                }
+                .accessibilityIdentifier("native.diagnostics.open-review")
+                if report.issues.isEmpty {
+                    Text("未发现重复原始 ID、可疑相近记录、未来已服记录、未知药物代号或无效格式。")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                ForEach(report.issues) { issue in
+                    NavigationLink {
+                        PKDataReviewNativeView(selectedIssue: issue.id)
+                    } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(issue.title).font(.subheadline.bold())
+                            Spacer()
+                            Text("\(PKDataReview.rows(for: issue.id, snapshot: store.snapshot, catalog: store.catalog).filter { !store.isAuditConfirmed($0.fingerprint) }.count) 待核对")
+                                    .monospacedDigit().foregroundStyle(.orange)
+                        }
+                        Text(issue.detail).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    } // audit detail link
+                }
+                Button {
+                    UIPasteboard.general.string = PKDataHealth.supportSummary(
+                        report: report, appVersion: store.installedReleaseDescription,
+                        localSaved: store.lastLocalSavedAt != nil,
+                        pendingSync: store.hasPendingChanges,
+                        sessionVerified: store.accessState == .verified,
+                        modelAvailable: store.selectedDrug != nil)
+                    diagnosticsCopied = true
+                } label: {
+                    Label(diagnosticsCopied ? "已复制脱敏诊断摘要" : "复制脱敏诊断摘要",
+                          systemImage: diagnosticsCopied ? "checkmark.circle" : "doc.on.clipboard")
+                }
+                .accessibilityIdentifier("native.diagnostics.copy")
+                if diagnosticsCopied {
+                    Label("诊断摘要已复制。只含条数、状态和版本信息，不含药物名称或剂量。",
+                          systemImage: "checkmark.circle")
+                        .font(.caption2).foregroundStyle(.mint)
+                }
+                Text("这里不自动合并或删除任何记录。可疑重复也可能是真实的分次服用，先在历史中核实。若要寻求技术支持，可主动粘贴脱敏摘要；如涉及 HealthKit 崩溃，还应另行导出 iOS 的 PKAtlas .ips 日志。")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
 
             Section("数据导出与完整性") {
@@ -369,14 +340,6 @@ struct SettingsNativeView: View {
         } message: {
             Text("云端未确认的本机草稿会继续加密保存，下一次登录可尝试恢复。")
         }
-        .confirmationDialog("导入 Apple 健康中已登记的实际服用？", isPresented: $showHealthImportConfirmation) {
-            Button("确认导入到药时") {
-                let result = store.importHealthMatches(healthMedications.matches)
-                healthImportResult = "新增 \(result.imported) 条，关联已有 \(result.linked) 条，跳过 \(result.skipped) 条未匹配或已关联记录。"
-            }
-        } message: {
-            Text("仅导入名称唯一匹配、剂量以质量单位换算为 mg 的已服记录；不把待服和假设节点作为真实服药。")
-        }
         .confirmationDialog("放弃本机冲突数据？", isPresented: $showConflictConfirmation) {
             Button("采用云端版本并放弃冲突的本机更改", role: .destructive) {
                 Task { await store.resolveConflictByUsingCloud() }
@@ -394,7 +357,7 @@ struct SettingsNativeView: View {
             let pending = try PKWebAuthRequest.create()
             let result = try await webAuthenticationSession.authenticate(
                 using: pending.url,
-                callback: .customScheme("pkatlasopen"),
+                callback: .customScheme("pkatlas"),
                 preferredBrowserSession: .shared,
                 additionalHeaderFields: [:]
             )
@@ -412,15 +375,4 @@ struct SettingsNativeView: View {
         }
     }
 
-    private func fetchSessions() async {
-        loadingSessions = true
-        defer { loadingSessions = false }
-        do {
-            let response: SessionList = try await PKCloudAPI.shared.request("/api/sessions")
-            currentSessions = response.sessions
-        } catch {
-            store.errorMessage = error.localizedDescription
-            store.showingError = true
-        }
-    }
 }

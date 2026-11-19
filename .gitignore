@@ -17,3 +17,7 @@ DerivedData/
 private/
 local/
 *_private*
+
+# Generated locally by xcodegen
+PKAtlas.xcodeproj/
+DerivedData/
