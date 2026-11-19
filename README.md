@@ -1,6 +1,6 @@
 # PKAtlas · 药时（开源 iOS 版）
 
-> **Current public source snapshot: v2.24 Build 30 (2026-11-19).** It includes native SwiftUI dose/history/chart/inverse and confirmed-planned-state flows. The sanitized source uses placeholder origins and bundle IDs. The production unsigned IPA is private; this public repository only carries source code. Model signing and optional cloud endpoints need to be configured for each deployment.
+> **Current public source snapshot: v2.25 Build 31 (2026-11-19).** It includes native SwiftUI dose/history/chart/inverse and confirmed-planned-state flows. The sanitized source uses placeholder origins and bundle IDs. The production unsigned IPA is private; this public repository only carries source code. Model signing and optional cloud endpoints need to be configured for each deployment.
 
 
 Local-first pharmacokinetic modeling, visualization and mathematical inverse-scenario exploration. The public build does **not** include any personal server domain, origin IP, session token, HealthKit data or private backend credentials.
@@ -41,3 +41,7 @@ The `PKATLAS_SIGNED_RELEASE_V1` notice in the GitHub Release body is Ed25519 aut
 Models are group-level estimates, not personal blood measurements or clinical treatment recommendations. Never use inverse-model outputs to determine real-world doses. HealthKit permissions depend on the signer's entitlements; read-only access is not guaranteed merely by compiling the app. Dynamic executable-code downloading is not guaranteed to comply with App Store Review Guideline 2.5.2.
 
 Read [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md) and [LICENSE](LICENSE) before deploying or redistributing. Please do not add origin hosts, personal network ranges, user data, signing keys or secrets to issues, commits, CI logs or release assets.
+
+## November 19, 2026 · superseded adopted-plan hotfix
+
+When a new accepted adjustment replaces an old mathematical model, only the current revision may show actionable dose-confirmation nodes. Stale iOS local notification requests are cancelled and rebuilt from the verified cloud event set; previously entered actual dose records are never deleted.
