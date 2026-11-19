@@ -1,4 +1,4 @@
-# PKAtlas iOS source snapshot · v2.25 Build 31
+# PKAtlas iOS source snapshot · v2.26 Build 32
 
 This public source snapshot corresponds to the current native SwiftUI iOS feature set. Real deployment origins and identifiers have been replaced with `pk.example.com` and `com.example`. Private cloud credentials, account sessions, signing private keys, Apple provisioning, and unpublished machine logs are excluded.
 
