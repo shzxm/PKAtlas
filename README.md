@@ -1,6 +1,6 @@
 # PKAtlas · 药时（开源 iOS 版）
 
-> **Current public source snapshot: v2.26 Build 32 (2026-11-19).** It includes native SwiftUI dose/history/chart/inverse and confirmed-planned-state flows. The sanitized source uses placeholder origins and bundle IDs. The production unsigned IPA is private; this public repository only carries source code. Model signing and optional cloud endpoints need to be configured for each deployment.
+> **Current public source snapshot: v2.27 Build 33 (2026-11-19).** It includes native SwiftUI dose/history/chart/inverse and confirmed-planned-state flows. The sanitized source uses placeholder origins and bundle IDs. The production unsigned IPA is private; this public repository only carries source code. Model signing and optional cloud endpoints need to be configured for each deployment.
 
 
 Local-first pharmacokinetic modeling, visualization and mathematical inverse-scenario exploration. The public build does **not** include any personal server domain, origin IP, session token, HealthKit data or private backend credentials.
@@ -45,3 +45,7 @@ Read [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md) and [LICENSE](LICENSE)
 ## November 19, 2026 · superseded adopted-plan hotfix
 
 When a new accepted adjustment replaces an old mathematical model, only the current revision may show actionable dose-confirmation nodes. Stale iOS local notification requests are cancelled and rebuilt from the verified cloud event set; previously entered actual dose records are never deleted.
+
+## 2026-11-20 · v2.27 Build 33
+
+The Today screen opens the same dose editor as History. The optional standalone Swift chart tab is hidden by default; enable it in Settings (我的) to instantiate/render that tab, while inverse chart remains available. A next-day inverse target is horizontally located on today’s 48-hour timeline and only the selected inverse reference unit is drawn. Zero-taken-dose cases use the saved whole-unit strengths without requiring a prior recorded dose; infeasible constraints remain explicit. The production IPA stays in a separate private Release.
